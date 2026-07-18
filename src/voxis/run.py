@@ -137,16 +137,23 @@ def transcribe(options: TranscribeOptions, config: VoxisConfig) -> int:
             progress.event(
                 "speaker_map",
                 "failed" if speaker_map_result.status == "failed" else "done",
-                {"status": speaker_map_result.status, "issue_count": len(speaker_map_result.issues)},
+                {
+                    "status": speaker_map_result.status,
+                    "failure_kind": speaker_map_result.failure_kind,
+                    "issue_count": len(speaker_map_result.issues),
+                },
             )
         else:
             speaker_map_result = None
         speaker_map_failed = speaker_map_result is not None and speaker_map_result.status == "failed"
-        if speaker_map_failed:
+        if speaker_map_result is not None and speaker_map_result.status == "failed":
             progress.event(
                 "speaker_map",
                 "fallback",
-                {"reason": "speaker map failed; keeping unmapped SPEAKER_XX labels"},
+                {
+                    "reason": "speaker map failed; keeping unmapped SPEAKER_XX labels",
+                    "failure_kind": speaker_map_result.failure_kind,
+                },
             )
         turns = (
             apply_speaker_map_to_turns(raw_turns, speaker_map_result.mapping)

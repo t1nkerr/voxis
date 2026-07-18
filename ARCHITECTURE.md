@@ -40,7 +40,8 @@ Optional:
 - `VOXIS_LLM_API_KEY`: used for ASR term extraction, speaker-name mapping, and `--polish`.
   `BAILIAN_API_KEY` is accepted as a fallback.
 - `VOXIS_LLM_BASE_URL`, `VOXIS_POLISH_MODEL`, `VOXIS_SPEAKER_MAP_MODEL`, `VOXIS_ASR_TERMS_MODEL`:
-  provider overrides. Defaults target Alibaba Bailian/DashScope.
+  provider overrides. Defaults target Alibaba Bailian/DashScope. The endpoint must support OpenAI's strict
+  JSON Schema response format; transport compatibility alone is insufficient for Voxis LLM features.
 - `VOXIS_ASR_TERMS`: comma-separated glossary terms merged into every ASR prompt. Empty by default.
 - `VOXIS_LLM_DISABLE_THINKING`: `true`/`false` override for sending `enable_thinking=false` to the LLM
   endpoint. Default is on for DashScope URLs and off otherwise.

@@ -56,6 +56,7 @@ Return only JSON in the shape below:
 @dataclass(frozen=True)
 class SpeakerMapResult:
     status: str
+    failure_kind: str | None
     mapping: dict[str, str]
     probe_speakers: list[str]
     all_turn_speakers: list[str]
@@ -122,6 +123,7 @@ def build_speaker_map(
         except Exception as exc:
             return SpeakerMapResult(
                 status="failed",
+                failure_kind="llm_error",
                 mapping={},
                 probe_speakers=probe_speakers,
                 all_turn_speakers=all_turn_speakers,
@@ -138,7 +140,7 @@ def build_speaker_map(
                 prompt_template_id=SPEAKER_MAP_PROMPT_TEMPLATE_ID,
                 prompt_sha256=sha256_text(prompt),
                 evidence_mode=evidence_mode,
-                thinking_enabled=False,
+                thinking_enabled=_thinking_enabled_receipt(config),
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 elapsed_seconds=elapsed_seconds,
@@ -162,8 +164,10 @@ def build_speaker_map(
         evidence_text=f"{stripped_context}\n{_turns_to_text(probe_turns)}",
         base_issues=base_issues,
     )
+    status = _status_from_speaker_map(raw_mapping=raw_mapping, issues=issues)
     return SpeakerMapResult(
-        status=_status_from_speaker_map(raw_mapping=raw_mapping, issues=issues),
+        status=status,
+        failure_kind="invalid_output" if status == "failed" else None,
         mapping=mapping,
         probe_speakers=probe_speakers,
         all_turn_speakers=all_turn_speakers,
@@ -173,7 +177,7 @@ def build_speaker_map(
         prompt_template_id=SPEAKER_MAP_PROMPT_TEMPLATE_ID,
         prompt_sha256=sha256_text(prompt),
         evidence_mode=evidence_mode,
-        thinking_enabled=False,
+        thinking_enabled=_thinking_enabled_receipt(config),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         elapsed_seconds=elapsed_seconds,
@@ -198,6 +202,7 @@ def speaker_map_payload(result: SpeakerMapResult) -> dict[str, Any]:
     return {
         "schema_version": SPEAKER_MAP_SCHEMA_VERSION,
         "status": result.status,
+        "failure_kind": result.failure_kind,
         "mapping": result.mapping,
         "probe_speakers": result.probe_speakers,
         "all_turn_speakers": result.all_turn_speakers,
@@ -224,6 +229,7 @@ def speaker_map_provider_payload(result: SpeakerMapResult | None, *, enabled: bo
     return {
         "enabled": enabled,
         "status": result.status,
+        "failure_kind": result.failure_kind,
         "model": result.model,
         "prompt_template_id": result.prompt_template_id,
         "evidence_mode": result.evidence_mode,
@@ -244,6 +250,7 @@ def _skipped(
 ) -> SpeakerMapResult:
     return SpeakerMapResult(
         status=status,
+        failure_kind=None,
         mapping={},
         probe_speakers=probe_speakers,
         all_turn_speakers=all_turn_speakers,
@@ -251,6 +258,10 @@ def _skipped(
         probe_turns=[],
         evidence_mode=evidence_mode,
     )
+
+
+def _thinking_enabled_receipt(config: VoxisConfig) -> bool | None:
+    return False if config.llm_disable_thinking else None
 
 
 def _speaker_map_probe(turns: list[Turn]) -> list[_ProbeTurn]:

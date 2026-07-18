@@ -706,11 +706,19 @@ def test_speaker_map_failure_falls_back_to_unmapped_turns(
     ]
     assert transcript == "# Transcript\n\n[00:00:00] SPEAKER_00: Hello\n"
     assert run["providers"]["speaker_map"]["status"] == "failed"
+    assert run["providers"]["speaker_map"]["failure_kind"] == "invalid_output"
     assert speaker_map["status"] == "failed"
+    assert speaker_map["failure_kind"] == "invalid_output"
     assert {issue["code"] for issue in speaker_map["issues"]} == {"EXTRA_KEY", "BAD_VALUE"}
     events = [(event["stage"], event["event"]) for event in progress]
     assert ("speaker_map", "failed") in events
     assert ("speaker_map", "fallback") in events
+    assert (
+        next(event for event in progress if event["stage"] == "speaker_map" and event["event"] == "fallback")[
+            "failure_kind"
+        ]
+        == "invalid_output"
+    )
     assert progress[-1]["stage"] == "run"
     assert progress[-1]["event"] == "done"
     stderr = capsys.readouterr().err

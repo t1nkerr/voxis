@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -75,22 +76,54 @@ echo runner-ok
     )
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path))
-    audio_path = tmp_path / "audio.wav"
+    audio_path = tmp_path / "audio.mp3"
     audio_path.write_bytes(b"fake audio")
     audio = LoadedAudio(
         path=audio_path,
         sample_rate_hz=16_000,
-        waveform=np.zeros(0, dtype=np.float32),
+        waveform=np.array([-1.0, -0.5, 0.0, 0.5, 1.0], dtype=np.float32),
         duration_s=1.25,
     )
 
     result = diarize_audio(audio)
 
     assert [(span.start, span.end, span.speaker) for span in result.spans] == [(0.0, 1.25, "SPEAKER_01")]
-    assert result.command[:3] == ["fluidaudio", "sortformer", str(audio_path)]
+    assert result.command[:2] == ["fluidaudio", "sortformer"]
+    assert result.command[2].endswith("/sortformer_input.wav")
+    assert result.command[2] != str(audio_path)
     assert result.runner["returncode"] == 0
     assert result.runner["stdout"] == "runner-ok"
     assert result.raw_payload["segment_count"] == 1
+
+
+def test_diarize_audio_writes_mono_16khz_pcm_for_sortformer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    capture = tmp_path / "captured.wav"
+    executable = tmp_path / "fluidaudio"
+    executable.write_text(
+        f"""#!/bin/sh
+cp "$2" "{capture}"
+printf '%s\n' '{{"segments":[]}}' > "$4"
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/bin")
+    source = tmp_path / "meeting.m4a"
+    source.write_bytes(b"compressed input")
+    audio = LoadedAudio(
+        path=source,
+        sample_rate_hz=16_000,
+        waveform=np.array([-1.0, 0.0, 1.0], dtype=np.float32),
+        duration_s=3 / 16_000,
+    )
+
+    diarize_audio(audio)
+
+    with wave.open(str(capture), "rb") as wav:
+        assert wav.getnchannels() == 1
+        assert wav.getframerate() == 16_000
+        assert wav.getsampwidth() == 2
+        assert wav.getnframes() == 3
 
 
 def test_diarize_audio_reports_nonzero_sortformer_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

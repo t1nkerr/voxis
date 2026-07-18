@@ -6,9 +6,12 @@ import shutil
 import subprocess
 import tempfile
 import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from voxis.audio import LoadedAudio
 from voxis.diarization_types import DiarizeSpan
@@ -22,6 +25,7 @@ SORTFORMER_INSTALL_HINT = (
     "(see https://github.com/t1nkerr/voxis#diarization-setup), then verify with `which fluidaudio`."
 )
 SORTFORMER_TIMEOUT_SECONDS = 3600
+SORTFORMER_SAMPLE_RATE_HZ = 16_000
 SORTFORMER_SPEAKER_RE = re.compile(r"(?:speaker\s*)?(\d+)$", re.IGNORECASE)
 
 
@@ -48,8 +52,10 @@ def diarize_audio(audio: LoadedAudio) -> DiarizationResult:
         raise RuntimeError(SORTFORMER_INSTALL_HINT)
 
     with tempfile.TemporaryDirectory(prefix="voxis-sortformer-") as tmp:
+        wav_path = Path(tmp) / "sortformer_input.wav"
         raw_path = Path(tmp) / "sortformer_raw.json"
-        command = _sortformer_command(audio.path, raw_path)
+        _write_sortformer_wav(audio, wav_path)
+        command = _sortformer_command(wav_path, raw_path)
         started = time.perf_counter()
         try:
             completed = subprocess.run(
@@ -95,6 +101,17 @@ def _sortformer_command(audio_path: Path, output_path: Path) -> list[str]:
         "--config",
         SORTFORMER_CONFIG,
     ]
+
+
+def _write_sortformer_wav(audio: LoadedAudio, path: Path) -> None:
+    if audio.sample_rate_hz != SORTFORMER_SAMPLE_RATE_HZ:
+        raise ValueError(f"Sortformer input must be {SORTFORMER_SAMPLE_RATE_HZ} Hz; got {audio.sample_rate_hz} Hz")
+    pcm = (np.clip(audio.waveform, -1.0, 1.0) * np.iinfo(np.int16).max).astype("<i2")
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(SORTFORMER_SAMPLE_RATE_HZ)
+        wav.writeframes(pcm.tobytes())
 
 
 def _parse_sortformer_spans(payload: Any) -> list[DiarizeSpan]:

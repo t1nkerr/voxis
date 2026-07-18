@@ -50,12 +50,14 @@ def test_build_speaker_map_fails_when_probe_speaker_is_omitted(monkeypatch: Monk
     result = build_speaker_map(turns, context="Host: Alice", config=config)
 
     assert result.status == "failed"
+    assert result.failure_kind == "invalid_output"
     assert result.model == "speaker-map-model"
     assert result.thinking_enabled is False
     assert result.mapping == {"SPEAKER_00": "Alice"}
     assert {issue["code"] for issue in result.issues} == {"EXTRA_SPEAKER_KEY", "MISSING_SPEAKER_KEY"}
     payload = speaker_map_payload(result)
     assert payload["schema_version"] == "speaker_map_v1"
+    assert payload["failure_kind"] == "invalid_output"
     assert payload["model"] == "speaker-map-model"
     assert payload["thinking_enabled"] is False
     assert payload["prompt_tokens"] == 11
@@ -198,6 +200,7 @@ def test_build_speaker_map_fails_when_llm_fails(monkeypatch: MonkeyPatch) -> Non
     result = build_speaker_map([Turn("SPEAKER_00", 0.0, 1.0, "hello")], context="Host: Alice", config=make_config())
 
     assert result.status == "failed"
+    assert result.failure_kind == "llm_error"
     assert result.model == "speaker-map-model"
     assert result.mapping == {}
     assert result.issues[0]["code"] == "LLM_ERROR"
@@ -236,11 +239,35 @@ def test_malformed_speaker_map_response_fails(monkeypatch: MonkeyPatch) -> None:
     result = build_speaker_map([Turn("SPEAKER_00", 0.0, 1.0, "hello")], context="Host: Alice", config=make_config())
 
     assert result.status == "failed"
+    assert result.failure_kind == "invalid_output"
     assert result.mapping == {}
     assert result.issues[0]["code"] == "MALFORMED_JSON"
     assert result.issues[0]["response_excerpt"] == "not json"
     assert result.issues[0]["response_length"] == 8
     assert "preserving raw speaker labels" not in result.issues[0]["detail"]
+
+
+def test_speaker_map_thinking_receipt_is_unknown_when_not_explicitly_disabled(monkeypatch: MonkeyPatch) -> None:
+    def fake_call_json_schema_llm(
+        prompt: str,
+        *,
+        config: VoxisConfig,
+        model: str,
+        schema_name: str,
+        schema: dict[str, object],
+        max_tokens: int = 2048,
+        extra_body: dict[str, object] | None = None,
+    ) -> LLMResponse:
+        assert extra_body is None
+        return LLMResponse('{"mapping":{"SPEAKER_00":null}}', 0.1, 4, 2)
+
+    monkeypatch.setattr("voxis.speaker_map.call_json_schema_llm", fake_call_json_schema_llm)
+    config = make_config(llm_disable_thinking=False)
+
+    result = build_speaker_map([Turn("SPEAKER_00", 0.0, 1.0, "hello")], context=None, config=config)
+
+    assert result.status == "succeeded"
+    assert result.thinking_enabled is None
 
 
 def test_malformed_speaker_map_response_retries_once(monkeypatch: MonkeyPatch) -> None:
@@ -551,10 +578,11 @@ def test_legacy_unknown_sentinel_is_rejected(monkeypatch: MonkeyPatch) -> None:
     assert [issue["code"] for issue in result.issues] == ["INVALID_UNKNOWN_VALUE"]
 
 
-def make_config(api_key: str | None = "key") -> VoxisConfig:
+def make_config(api_key: str | None = "key", *, llm_disable_thinking: bool = True) -> VoxisConfig:
     return VoxisConfig(
         llm_base_url="https://api.example/v1",
         llm_api_key=api_key,
         polish_model="model",
         speaker_map_model="speaker-map-model",
+        llm_disable_thinking=llm_disable_thinking,
     )

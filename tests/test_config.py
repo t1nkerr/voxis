@@ -52,6 +52,15 @@ def test_load_config_voxis_key_takes_precedence_over_bailian(tmp_path: Path) -> 
     assert config.llm_api_key == "env-voxis"
 
 
+def test_load_config_environment_legacy_key_precedes_file_canonical_key(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("VOXIS_LLM_API_KEY=file-voxis\n", encoding="utf-8")
+
+    config = load_config(env_file=env_file, environ={"BAILIAN_API_KEY": "env-bailian"})
+
+    assert config.llm_api_key == "env-bailian"
+
+
 def test_load_config_reads_provider_overrides_from_environment() -> None:
     config = load_config(
         environ={

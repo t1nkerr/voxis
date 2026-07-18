@@ -67,7 +67,13 @@ def load_config(
             return _nonempty(env.get(name)) or default
         return _nonempty(file_values.get(name)) or default
 
-    llm_api_key = get("VOXIS_LLM_API_KEY") or get("BAILIAN_API_KEY")
+    def get_alias(primary: str, legacy: str) -> str | None:
+        for values in (env, file_values):
+            if primary in values or legacy in values:
+                return _nonempty(values.get(primary)) or _nonempty(values.get(legacy))
+        return None
+
+    llm_api_key = get_alias("VOXIS_LLM_API_KEY", "BAILIAN_API_KEY")
     llm_base_url = get("VOXIS_LLM_BASE_URL") or DEFAULT_LLM_BASE_URL
     disable_thinking_override = _parse_bool(get("VOXIS_LLM_DISABLE_THINKING"))
 
