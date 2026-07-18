@@ -194,12 +194,12 @@ def test_polish_turns_rejects_heading_text(monkeypatch: MonkeyPatch) -> None:
 
 
 def test_polish_turns_chunks_and_keeps_valid_chunk_when_later_chunk_fails(monkeypatch: MonkeyPatch) -> None:
-    responses = [_json_response(["Clean first."]), "not json"]
     prompts: list[str] = []
 
     def fake_call_json_schema_llm(prompt: str, *args: Any, **kwargs: Any) -> LLMResponse:
         prompts.append(prompt)
-        return LLMResponse(responses.pop(0), 1.0, 7, 3)
+        response = _json_response(["Clean first."]) if '"text": "first"' in prompt else "not json"
+        return LLMResponse(response, 1.0, 7, 3)
 
     monkeypatch.setattr("voxis.polish.call_json_schema_llm", fake_call_json_schema_llm)
     turns = [

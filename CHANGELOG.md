@@ -9,6 +9,7 @@ Initial public release.
 
 - Local MLX-based transcription (`voxis transcribe`) with Qwen3-ASR and forced alignment
 - Optional speaker diarization via the FluidAudio Sortformer CLI (`--diarize`)
+- One-command global installer with optional pinned FluidAudio setup and `voxis doctor`
 - Optional LLM term extraction, speaker-name mapping, and transcript polish (`--polish`)
 - OpenAI-compatible LLM endpoint configuration via `VOXIS_LLM_*` environment variables
   (defaults to Alibaba Bailian/DashScope; `BAILIAN_API_KEY` also accepted)

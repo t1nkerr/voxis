@@ -25,6 +25,14 @@ def test_cli_parser_has_program_name() -> None:
     assert parser.prog == "voxis"
 
 
+def test_doctor_cli_forwards_strict_diarization_mode(monkeypatch: MonkeyPatch) -> None:
+    calls: list[bool] = []
+    monkeypatch.setattr("voxis.cli.run_doctor", lambda *, require_diarize: calls.append(require_diarize) or 0)
+
+    assert main(["doctor", "--require-diarize"]) == 0
+    assert calls == [True]
+
+
 def test_transcribe_writes_phase_one_outputs(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

@@ -8,6 +8,7 @@ from typing import Sequence
 
 from voxis import __version__
 from voxis.config import load_config
+from voxis.doctor import run_doctor
 from voxis.run import TranscribeOptions, transcribe
 
 
@@ -19,14 +20,26 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe_parser = subparsers.add_parser("transcribe", help="Transcribe a local audio file.")
     transcribe_parser.add_argument("--audio", required=True, help="Local audio file to transcribe.")
     transcribe_parser.add_argument("--out", required=True, type=Path, help="Output directory.")
-    transcribe_parser.add_argument("--context", help="Optional transcript context text.")
+    transcribe_parser.add_argument("--context", help="Show notes for terminology, speaker-name mapping, and polish.")
     transcribe_parser.add_argument(
         "--language", choices=("auto", "en", "zh"), default="auto", help="ASR language hint."
     )
-    transcribe_parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization.")
+    transcribe_parser.add_argument(
+        "--diarize",
+        action="store_true",
+        help="Label speaker turns; an LLM key enables names and context improves mapping.",
+    )
     transcribe_parser.add_argument("--polish", action="store_true", help="Polish diarized transcript with an LLM.")
     transcribe_parser.add_argument("--debug", action="store_true", help="Write debug files under _debug/.")
     transcribe_parser.set_defaults(func=_run_transcribe)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Check local Voxis dependencies.")
+    doctor_parser.add_argument(
+        "--require-diarize",
+        action="store_true",
+        help="Return an error when the optional FluidAudio CLI is unavailable.",
+    )
+    doctor_parser.set_defaults(func=_run_doctor)
     return parser
 
 
@@ -74,3 +87,8 @@ def _run_transcribe(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         if args.debug:
             traceback.print_exc()
         return 1
+
+
+def _run_doctor(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    del parser
+    return run_doctor(require_diarize=bool(args.require_diarize))

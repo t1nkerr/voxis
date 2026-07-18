@@ -14,24 +14,57 @@ alignment, optional speaker diarization and LLM transcript polish.
 - Optional, for LLM features: an API key for an OpenAI-compatible endpoint
   (defaults to Alibaba Bailian/DashScope)
 
-## Setup
+## Install
 
 ```bash
-uv sync
-mkdir -p ~/.config/voxis
-cp .env.example ~/.config/voxis/.env
+git clone https://github.com/t1nkerr/voxis.git
+cd voxis
+./scripts/install.sh
 ```
 
-Use `~/.config/voxis/.env` for machine-local secrets. A repo-local `.env` is only for
-temporary development overrides.
+For speaker diarization, use the full installer. It pins and builds FluidAudio from source,
+so a working Xcode/Swift C++ toolchain is required. Before changing anything, the installer
+compiles a tiny C++ probe to verify that Git, Swift, and the selected Xcode toolchain are usable.
+
+```bash
+./scripts/install.sh --with-diarize
+```
+
+The installer does not install Homebrew, ffmpeg, or Xcode automatically. It stops with the
+exact missing prerequisite. It installs a normal global `voxis` command, creates
+`~/.config/voxis/.env` only when absent, and never overwrites existing config.
+
+Check readiness at any time:
+
+```bash
+voxis doctor
+voxis doctor --require-diarize
+```
+
+Use `~/.config/voxis/.env` for machine-local secrets.
+
+### What each feature needs
+
+| Feature | Requirements |
+| --- | --- |
+| Base transcription and alignment | Base installer; no LLM key or context required |
+| Anonymous speaker diarization (`SPEAKER_00`, `SPEAKER_01`, ...) | Full installer plus `--diarize`; no LLM key or context required |
+| Reliable speaker-name mapping | Diarization and an LLM API key; `--context` with names and roles is strongly recommended |
+| Transcript polish | Diarization and an LLM API key; `--context` is strongly recommended |
 
 ## Usage
 
 ```bash
-uv run voxis transcribe --audio meeting.m4a --out out/meeting
-uv run voxis transcribe --audio meeting.m4a --out out/meeting --diarize --polish \
+voxis transcribe --audio meeting.m4a --out out/meeting
+voxis transcribe --audio meeting.m4a --out out/meeting --diarize --polish \
   --context "Weekly product sync with Alice and Bob"
 ```
+
+Diarization alone detects speaker changes and uses anonymous labels such as `SPEAKER_00`.
+An LLM API key enables mapping those labels from transcript evidence such as self-introductions.
+For reliable mapping, also pass available show notes through `--context`, including speaker
+names and roles. Company or product names, acronyms, and other proper nouns in the context
+also improve ASR term extraction and optional polish.
 
 The first run downloads the ASR and alignment models (several GB) from Hugging Face;
 later runs reuse the local cache.
@@ -47,17 +80,18 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full input/output contract.
 ## Diarization setup
 
 `--diarize` uses the [FluidAudio](https://github.com/FluidInference/FluidAudio) Sortformer
-CLI installed as `fluidaudio` on `PATH`. Install it from a FluidAudio checkout with:
+CLI installed as `fluidaudio` on `PATH`. The supported installer pins the tested FluidAudio
+version, builds it, and places it beside the global `voxis` command:
 
 ```bash
-scripts/install_fluidaudio_cli.sh /path/to/FluidAudio
+./scripts/install.sh --with-diarize
 ```
 
 Verify the runtime dependency after install:
 
 ```bash
-uv run which fluidaudio
-uv run voxis-bench run-sortformer --audio /path/to/short-audio.m4a --out /tmp/voxis-fluidaudio-smoke --model-id smoke
+voxis doctor --require-diarize
+voxis-bench run-sortformer --audio /path/to/short-audio.m4a --out /tmp/voxis-fluidaudio-smoke --model-id smoke
 ```
 
 ## Configuration
@@ -79,6 +113,7 @@ over file values.
 ## Development
 
 ```bash
+uv sync
 uv run pytest
 uv run ruff check src tests
 uv run mypy src

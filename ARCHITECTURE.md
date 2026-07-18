@@ -21,9 +21,11 @@ Required:
 
 Optional:
 
-- `--context`: text containing any useful context, such as title, show notes, authors, source name, or glossary terms.
+- `--context`: title, show notes, speaker names and roles, source name, or glossary terms. Speaker names and
+  roles improve LLM mapping of anonymous diarization labels to real people.
 - `--language`: ASR language hint. Default is `auto`.
-- `--diarize`: enable Sortformer diarization and timestamped speaker turns.
+- `--diarize`: enable Sortformer diarization and timestamped speaker turns with anonymous labels. Context is
+  not required for diarization itself.
 - `--polish`: enable LLM transcript polish. Allowed only with `--diarize`. Requires `VOXIS_LLM_API_KEY` (or `BAILIAN_API_KEY`).
 - `--debug`: write debug files.
 
@@ -50,7 +52,7 @@ Machine setup:
 
 - ffmpeg must be installed for audio decoding.
 - [FluidAudio](https://github.com/FluidInference/FluidAudio) CLI must be installed as `fluidaudio` on `PATH`.
-  From a FluidAudio checkout, run `scripts/install_fluidaudio_cli.sh /path/to/FluidAudio`.
+  Use `./scripts/install.sh --with-diarize` to pin, build, install, and verify it.
 
 ## Providers
 
