@@ -189,7 +189,7 @@ def test_diarize_audio_missing_cli_error_points_to_readme(tmp_path: Path, monkey
 
 def test_diarize_audio_times_out_hung_sortformer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     executable = tmp_path / "fluidaudio"
-    executable.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+    executable.write_text("#!/bin/sh\n/bin/sleep 30\n", encoding="utf-8")
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr("voxis.diarize.SORTFORMER_TIMEOUT_SECONDS", 0.2)
