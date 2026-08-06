@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -27,6 +28,16 @@ ALIGNER_MODEL_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 SAMPLE_RATE_HZ = 16_000
 CHUNK_DURATION_SECONDS = 60.0
 MAX_TOKENS_BUDGET = 524_288
+DEGENERATION_RETRY_CHUNK_DURATION_SECONDS = 30.0
+DEGENERATION_RETRY_MAX_TOKENS_BUDGET = 8_192
+DEGENERATION_RETRY_MAX_COVERAGE_GAP_SECONDS = 0.1
+DEGENERATION_RETRY_MAX_TOTAL_UNCOVERED_SECONDS = 0.1
+DEGENERATION_MIN_DURATION_SECONDS = 10.0
+DEGENERATION_MIN_TEXT_CHARS = 1_000
+DEGENERATION_MIN_CHARS_PER_SECOND = 50.0
+DEGENERATION_MAX_LOOP_UNIT_CHARS = 32
+DEGENERATION_MIN_REPEATED_SEQUENCE_COVERAGE = 0.8
+DEGENERATION_POLICY_ID = "asr_segment_degeneration_guard_v1"
 TRUNCATION_MIN_GAP_SECONDS = 120.0
 TRUNCATION_GAP_RATIO = 0.2
 PROFILE_ID = "qwen3_asr_forced_aligner_v1"
@@ -46,6 +57,7 @@ class AsrResult:
     term_extraction: TermExtractionResult
     prompt_echo: PromptEchoResult
     prompt_echo_trimmed_segment_count: int
+    degeneration_retries: list[dict[str, Any]]
 
 
 def transcribe_audio(
@@ -55,6 +67,7 @@ def transcribe_audio(
     language: str,
     config: VoxisConfig,
     progress: ProgressCallback | None = None,
+    require_complete_alignment: bool = False,
 ) -> AsrResult:
     term_extraction = extract_terms(context, config=config)
     terms = prompt_terms(term_extraction.terms, config=config)
@@ -116,6 +129,12 @@ def transcribe_audio(
             suspect_segment_count=len(prompt_echo.suspect_segments),
             trimmed_segment_count=prompt_echo_trimmed_segment_count,
         )
+    segments, degeneration_retries = _recover_degenerate_segments(
+        segments,
+        waveform=waveform,
+        language=language,
+        progress=progress,
+    )
     truncation_gap = _truncation_gap_seconds(segments, audio_duration_s=audio.duration_s)
     if truncation_gap is not None:
         _emit_progress(
@@ -140,7 +159,8 @@ def transcribe_audio(
         "done",
         detected_language=str(primary_language),
         segment_count=len(segments),
-        transcript_chars=len(str(asr_output.text)),
+        transcript_chars=len(_segments_text(segments)),
+        degeneration_retry_count=len(degeneration_retries),
     )
 
     _emit_progress(progress, "alignment", "started", segment_count=len(segments))
@@ -182,13 +202,21 @@ def transcribe_audio(
         _emit_progress(progress, "alignment", "failed", error_type=type(exc).__name__, error_message=str(exc))
         raise
 
-    _emit_progress(
-        progress,
-        "alignment",
-        "done",
-        word_count=len(words),
-        error_count=len(alignment_errors),
-    )
+    if require_complete_alignment and alignment_errors:
+        first_error = alignment_errors[0]
+        _emit_progress(
+            progress,
+            "alignment",
+            "failed",
+            reason="unresolved_segment_errors",
+            error_count=len(alignment_errors),
+            first_error=first_error,
+        )
+        raise RuntimeError(
+            f"forced alignment failed for {len(alignment_errors)} segment(s); "
+            "diarization requires complete word timestamps"
+        )
+    _emit_progress(progress, "alignment", "done", word_count=len(words), error_count=len(alignment_errors))
     return AsrResult(
         text=_segments_text(segments) or str(asr_output.text),
         language=str(primary_language),
@@ -200,6 +228,7 @@ def transcribe_audio(
             term_extraction=term_extraction,
             prompt_echo=prompt_echo,
             prompt_echo_trimmed_segment_count=prompt_echo_trimmed_segment_count,
+            degeneration_retry_count=len(degeneration_retries),
             config=config,
         ),
         segments=segments,
@@ -208,7 +237,221 @@ def transcribe_audio(
         term_extraction=term_extraction,
         prompt_echo=prompt_echo,
         prompt_echo_trimmed_segment_count=prompt_echo_trimmed_segment_count,
+        degeneration_retries=degeneration_retries,
     )
+
+
+def _recover_degenerate_segments(
+    segments: list[dict[str, Any]],
+    *,
+    waveform: Any,
+    language: str,
+    progress: ProgressCallback | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    recovered: list[dict[str, Any]] = []
+    retries: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments):
+        initial_metrics = _segment_degeneration_metrics(segment)
+        if not initial_metrics["suspect"]:
+            recovered.append(segment)
+            continue
+
+        _emit_progress(
+            progress,
+            "asr",
+            "degenerate_segment_detected",
+            attempt="initial",
+            segment_index=index,
+            metrics=initial_metrics,
+        )
+        start = float(segment["start"])
+        end = float(segment["end"])
+        start_sample = max(0, int(start * SAMPLE_RATE_HZ))
+        end_sample = min(len(waveform), max(start_sample, int(end * SAMPLE_RATE_HZ)))
+        retry_kwargs: dict[str, Any] = {
+            "language": None if language == "auto" else language,
+            "chunk_duration": DEGENERATION_RETRY_CHUNK_DURATION_SECONDS,
+            "max_tokens": DEGENERATION_RETRY_MAX_TOKENS_BUDGET,
+        }
+        _emit_progress(
+            progress,
+            "asr",
+            "segment_retry_started",
+            segment_index=index,
+            segment_start=segment["start"],
+            segment_end=segment["end"],
+            chunk_duration_seconds=DEGENERATION_RETRY_CHUNK_DURATION_SECONDS,
+            max_tokens_budget=DEGENERATION_RETRY_MAX_TOKENS_BUDGET,
+            context_prompt=False,
+            metrics=initial_metrics,
+        )
+        try:
+            retry_output = _generate_asr(waveform[start_sample:end_sample], retry_kwargs)
+        except Exception as exc:
+            _emit_progress(
+                progress,
+                "asr",
+                "failed",
+                reason="degenerate_segment",
+                segment_index=index,
+                retry_error_type=type(exc).__name__,
+                retry_error_message=str(exc),
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            raise RuntimeError(f"ASR degenerate segment retry failed at {start:.3f}-{end:.3f}s") from exc
+
+        replacement = _offset_retry_segments(
+            [provider_segment_payload(item) for item in retry_output.segments],
+            offset_seconds=start,
+            duration_seconds=end - start,
+        )
+        retry_metrics = [_segment_degeneration_metrics(item) for item in replacement]
+        coverage_metrics = _retry_coverage_metrics(
+            replacement,
+            span_start=start,
+            span_end=end,
+        )
+        retry_record = {
+            "segment_index": index,
+            "segment_start": segment["start"],
+            "segment_end": segment["end"],
+            "initial_metrics": initial_metrics,
+            "retry_metrics": retry_metrics,
+            "coverage_metrics": coverage_metrics,
+            "replacement_segment_count": len(replacement),
+        }
+        retries.append(retry_record)
+        _emit_progress(
+            progress,
+            "asr",
+            "segment_retry_done",
+            segment_index=index,
+            replacement_segment_count=len(replacement),
+            metrics=retry_metrics,
+            coverage_metrics=coverage_metrics,
+        )
+        if not replacement or not coverage_metrics["complete"] or any(metrics["suspect"] for metrics in retry_metrics):
+            _emit_progress(
+                progress,
+                "asr",
+                "failed",
+                reason="degenerate_segment",
+                segment_index=index,
+                initial_metrics=initial_metrics,
+                retry_metrics=retry_metrics,
+                coverage_metrics=coverage_metrics,
+            )
+            raise RuntimeError(f"ASR degenerate segment persisted after retry at {start:.3f}-{end:.3f}s")
+        recovered.extend(replacement)
+    return recovered, retries
+
+
+def _offset_retry_segments(
+    segments: list[dict[str, Any]], *, offset_seconds: float, duration_seconds: float
+) -> list[dict[str, Any]]:
+    replacement: list[dict[str, Any]] = []
+    for segment in segments:
+        relative_start = max(0.0, float(segment["start"]))
+        relative_end = min(duration_seconds, float(segment["end"]))
+        if relative_end <= relative_start:
+            continue
+        replacement.append(
+            {
+                **segment,
+                "start": json_time(offset_seconds + relative_start),
+                "end": json_time(offset_seconds + relative_end),
+            }
+        )
+    return replacement
+
+
+def _segment_degeneration_metrics(segment: dict[str, Any]) -> dict[str, Any]:
+    text = str(segment.get("text", "")).strip()
+    duration_seconds = max(0.0, float(segment["end"]) - float(segment["start"]))
+    content_chars = [char for char in text if not char.isspace()]
+    character_counts = Counter(content_chars)
+    dominant_count = max(character_counts.values(), default=0)
+    dominant_ratio = dominant_count / len(content_chars) if content_chars else 0.0
+    repeated_sequence = _repeated_sequence_metrics("".join(content_chars))
+    chars_per_second = len(text) / duration_seconds if duration_seconds > 0 else float("inf")
+    suspect = (
+        duration_seconds >= DEGENERATION_MIN_DURATION_SECONDS
+        and len(text) >= DEGENERATION_MIN_TEXT_CHARS
+        and chars_per_second >= DEGENERATION_MIN_CHARS_PER_SECOND
+        and repeated_sequence["coverage"] >= DEGENERATION_MIN_REPEATED_SEQUENCE_COVERAGE
+    )
+    return {
+        "policy_id": DEGENERATION_POLICY_ID,
+        "duration_seconds": round(duration_seconds, 3),
+        "text_chars": len(text),
+        "chars_per_second": round(chars_per_second, 3),
+        "dominant_char": character_counts.most_common(1)[0][0] if content_chars else None,
+        "dominant_char_ratio": round(dominant_ratio, 4),
+        "repeated_sequence_unit_chars": repeated_sequence["unit_chars"],
+        "repeated_sequence": repeated_sequence["sequence"],
+        "repeated_sequence_coverage": repeated_sequence["coverage"],
+        "suspect": suspect,
+    }
+
+
+def _repeated_sequence_metrics(text: str) -> dict[str, Any]:
+    if not text:
+        return {"unit_chars": 0, "sequence": None, "coverage": 0.0}
+
+    best_unit_chars = 0
+    best_sequence: str | None = None
+    best_coverage = 0.0
+    max_unit_chars = min(DEGENERATION_MAX_LOOP_UNIT_CHARS, len(text))
+    for unit_chars in range(1, max_unit_chars + 1):
+        sequence_counts = Counter(text[index : index + unit_chars] for index in range(len(text) - unit_chars + 1))
+        sequence, count = sequence_counts.most_common(1)[0]
+        coverage = min(1.0, count * unit_chars / len(text))
+        if coverage > best_coverage:
+            best_unit_chars = unit_chars
+            best_sequence = sequence
+            best_coverage = coverage
+    return {
+        "unit_chars": best_unit_chars,
+        "sequence": best_sequence,
+        "coverage": round(best_coverage, 4),
+    }
+
+
+def _retry_coverage_metrics(segments: list[dict[str, Any]], *, span_start: float, span_end: float) -> dict[str, Any]:
+    if not segments:
+        return {
+            "start_gap_seconds": None,
+            "end_gap_seconds": None,
+            "maximum_internal_gap_seconds": None,
+            "total_uncovered_seconds": None,
+            "ordered_non_overlapping": True,
+            "complete": False,
+        }
+
+    starts = [float(segment["start"]) for segment in segments]
+    ends = [float(segment["end"]) for segment in segments]
+    ordered_non_overlapping = all(starts[index] >= ends[index - 1] for index in range(1, len(segments)))
+    internal_gaps = [max(0.0, starts[index] - ends[index - 1]) for index in range(1, len(segments))]
+    start_gap = max(0.0, starts[0] - span_start)
+    end_gap = max(0.0, span_end - ends[-1])
+    maximum_internal_gap = max(internal_gaps, default=0.0)
+    total_uncovered = start_gap + end_gap + sum(internal_gaps)
+    complete = (
+        ordered_non_overlapping
+        and all(
+            gap <= DEGENERATION_RETRY_MAX_COVERAGE_GAP_SECONDS for gap in (start_gap, end_gap, maximum_internal_gap)
+        )
+        and total_uncovered <= DEGENERATION_RETRY_MAX_TOTAL_UNCOVERED_SECONDS
+    )
+    return {
+        "start_gap_seconds": round(start_gap, 3),
+        "end_gap_seconds": round(end_gap, 3),
+        "maximum_internal_gap_seconds": round(maximum_internal_gap, 3),
+        "total_uncovered_seconds": round(total_uncovered, 3),
+        "ordered_non_overlapping": ordered_non_overlapping,
+        "complete": complete,
+    }
 
 
 def _alignment_items(aligned: Any) -> list[Any]:
@@ -226,6 +469,7 @@ def profile_payload(
     term_extraction: TermExtractionResult | None = None,
     prompt_echo: PromptEchoResult | None = None,
     prompt_echo_trimmed_segment_count: int = 0,
+    degeneration_retry_count: int = 0,
     config: VoxisConfig | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -236,6 +480,19 @@ def profile_payload(
         "chunk_duration_seconds": CHUNK_DURATION_SECONDS,
         "max_tokens_budget": MAX_TOKENS_BUDGET,
         "language": language,
+        "degeneration_guard": {
+            "policy_id": DEGENERATION_POLICY_ID,
+            "minimum_duration_seconds": DEGENERATION_MIN_DURATION_SECONDS,
+            "minimum_text_chars": DEGENERATION_MIN_TEXT_CHARS,
+            "minimum_chars_per_second": DEGENERATION_MIN_CHARS_PER_SECOND,
+            "maximum_loop_unit_chars": DEGENERATION_MAX_LOOP_UNIT_CHARS,
+            "minimum_repeated_sequence_coverage": DEGENERATION_MIN_REPEATED_SEQUENCE_COVERAGE,
+            "retry_chunk_duration_seconds": DEGENERATION_RETRY_CHUNK_DURATION_SECONDS,
+            "retry_max_tokens_budget": DEGENERATION_RETRY_MAX_TOKENS_BUDGET,
+            "retry_max_coverage_gap_seconds": DEGENERATION_RETRY_MAX_COVERAGE_GAP_SECONDS,
+            "retry_max_total_uncovered_seconds": DEGENERATION_RETRY_MAX_TOTAL_UNCOVERED_SECONDS,
+            "retry_count": degeneration_retry_count,
+        },
     }
     if term_extraction is not None:
         payload["term_extraction"] = term_extraction_payload(term_extraction)

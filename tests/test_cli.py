@@ -384,6 +384,295 @@ def test_transcribe_writes_plain_transcript_when_alignment_fails(tmp_path: Path,
     assert debug["alignment_errors"][0]["error_type"] == "RuntimeError"
 
 
+def test_diarized_transcribe_fails_before_diarization_when_alignment_fails(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = install_fake_mlx(monkeypatch, fail_alignment=True)
+    diarization_called = False
+
+    def unexpected_diarization(_audio: LoadedAudio) -> DiarizationResult:
+        nonlocal diarization_called
+        diarization_called = True
+        raise AssertionError("diarization must not run after an unresolved alignment error")
+
+    monkeypatch.setattr("voxis.run.diarize_audio", unexpected_diarization)
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--diarize", "--debug"]) == 1
+
+    assert calls["aligner_calls"]
+    assert diarization_called is False
+    assert "diarization requires complete word timestamps" in capsys.readouterr().err
+    assert not (out / "transcript.md").exists()
+    assert not (out / "run.json").exists()
+    progress = [
+        json.loads(line) for line in (out / "_debug" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        event["stage"] == "alignment" and event["event"] == "failed" and event["reason"] == "unresolved_segment_errors"
+        for event in progress
+    )
+
+
+def test_degenerate_asr_segment_retries_once_then_fails_before_alignment(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    degenerate_text = "正常开头" + ("对" * 40_370)
+    calls = install_fake_mlx(
+        monkeypatch,
+        asr_outputs=[
+            [{"start": 0.0, "end": 64.718, "text": degenerate_text, "language": "Chinese"}],
+            [{"start": 0.0, "end": 64.718, "text": degenerate_text, "language": "Chinese"}],
+        ],
+    )
+    monkeypatch.setattr("voxis.run.load_audio_file", _fake_loaded_audio(tmp_path, duration_seconds=64.718))
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--language", "zh", "--debug"]) == 1
+
+    assert len(calls["asr_calls"]) == 2
+    assert calls["asr_calls"][1]["chunk_duration"] == 30.0
+    assert calls["asr_calls"][1]["max_tokens"] == 8_192
+    assert "system_prompt" not in calls["asr_calls"][1]
+    assert "aligner_calls" not in calls
+    assert "ASR degenerate segment persisted after retry" in capsys.readouterr().err
+    assert not (out / "transcript.md").exists()
+    assert not (out / "run.json").exists()
+    progress = [
+        json.loads(line) for line in (out / "_debug" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    detected = next(event for event in progress if event["event"] == "degenerate_segment_detected")
+    retried = next(event for event in progress if event["event"] == "segment_retry_done")
+    failed = next(event for event in progress if event.get("reason") == "degenerate_segment")
+    assert detected["metrics"]["text_chars"] == len(degenerate_text)
+    assert detected["metrics"]["dominant_char"] == "对"
+    assert retried["metrics"][0]["suspect"] is True
+    assert failed["initial_metrics"]["suspect"] is True
+
+
+def test_clean_segment_retry_replaces_only_suspect_span_with_absolute_timestamps(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    calls = install_fake_mlx(
+        monkeypatch,
+        asr_outputs=[
+            [
+                {"start": 0.0, "end": 10.0, "text": "before", "language": "English"},
+                {"start": 10.0, "end": 20.0, "text": "x" * 2_000, "language": "English"},
+                {"start": 20.0, "end": 30.0, "text": "after", "language": "English"},
+            ],
+            [
+                {"start": 0.0, "end": 4.0, "text": "recovered first", "language": "English"},
+                {"start": 4.0, "end": 10.0, "text": "recovered second", "language": "English"},
+            ],
+        ],
+    )
+    monkeypatch.setattr("voxis.run.load_audio_file", _fake_loaded_audio(tmp_path, duration_seconds=30.0))
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--debug"]) == 0
+
+    debug = json.loads((out / "_debug" / "asr_segments.json").read_text(encoding="utf-8"))
+    assert [(segment["start"], segment["end"], segment["text"]) for segment in debug["segments"]] == [
+        (0.0, 10.0, "before"),
+        (10.0, 14.0, "recovered first"),
+        (14.0, 20.0, "recovered second"),
+        (20.0, 30.0, "after"),
+    ]
+    assert len(debug["degeneration_retries"]) == 1
+    assert len(calls["asr_calls"]) == 2
+    assert calls["asr_waveform_lengths"] == [30 * asr.SAMPLE_RATE_HZ, 10 * asr.SAMPLE_RATE_HZ]
+    run = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert run["providers"]["asr"]["degeneration_guard"]["retry_count"] == 1
+
+
+def test_segment_retry_rejects_truncated_first_chunk(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = install_fake_mlx(
+        monkeypatch,
+        asr_outputs=[
+            [{"start": 0.0, "end": 64.718, "text": "对的" * 20_000, "language": "Chinese"}],
+            [{"start": 0.0, "end": 30.0, "text": "clean but incomplete retry", "language": "English"}],
+        ],
+    )
+    monkeypatch.setattr("voxis.run.load_audio_file", _fake_loaded_audio(tmp_path, duration_seconds=64.718))
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--debug"]) == 1
+
+    assert len(calls["asr_calls"]) == 2
+    assert "ASR degenerate segment persisted after retry" in capsys.readouterr().err
+    progress = [
+        json.loads(line) for line in (out / "_debug" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    retried = next(event for event in progress if event["event"] == "segment_retry_done")
+    failed = next(event for event in progress if event.get("reason") == "degenerate_segment")
+    assert retried["coverage_metrics"] == {
+        "start_gap_seconds": 0.0,
+        "end_gap_seconds": 34.718,
+        "maximum_internal_gap_seconds": 0.0,
+        "total_uncovered_seconds": 34.718,
+        "ordered_non_overlapping": True,
+        "complete": False,
+    }
+    assert failed["coverage_metrics"]["complete"] is False
+    assert not (out / "transcript.md").exists()
+    assert not (out / "run.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("segments", "expected_total_uncovered", "expected_ordered"),
+    [
+        ([{"start": 0.11, "end": 9.89}], 0.22, True),
+        ([{"start": 0.0, "end": 4.9}, {"start": 5.11, "end": 10.0}], 0.21, True),
+        (
+            [
+                {"start": 0.0, "end": 2.0},
+                {"start": 2.05, "end": 4.0},
+                {"start": 4.05, "end": 6.0},
+                {"start": 6.05, "end": 10.0},
+            ],
+            0.15,
+            True,
+        ),
+        ([{"start": 0.0, "end": 6.0}, {"start": 5.9, "end": 10.0}], 0.0, False),
+    ],
+)
+def test_retry_coverage_rejects_edge_internal_accumulated_gaps_and_overlap(
+    segments: list[dict[str, float]], expected_total_uncovered: float, expected_ordered: bool
+) -> None:
+    metrics = asr._retry_coverage_metrics(segments, span_start=0.0, span_end=10.0)
+
+    assert metrics["total_uncovered_seconds"] == pytest.approx(expected_total_uncovered)
+    assert metrics["ordered_non_overlapping"] is expected_ordered
+    assert metrics["complete"] is False
+
+
+def test_segment_retry_rejects_empty_output(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    install_fake_mlx(
+        monkeypatch,
+        asr_outputs=[
+            [{"start": 0.0, "end": 20.0, "text": "对的" * 5_000, "language": "Chinese"}],
+            [],
+        ],
+    )
+    monkeypatch.setattr("voxis.run.load_audio_file", _fake_loaded_audio(tmp_path, duration_seconds=20.0))
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--debug"]) == 1
+
+    assert "ASR degenerate segment persisted after retry" in capsys.readouterr().err
+    progress = [
+        json.loads(line) for line in (out / "_debug" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    failed = next(event for event in progress if event.get("reason") == "degenerate_segment")
+    assert failed["retry_metrics"] == []
+    assert failed["coverage_metrics"]["complete"] is False
+
+
+def test_segment_retry_provider_exception_reports_structured_reason(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    install_fake_mlx(
+        monkeypatch,
+        asr_outputs=[[{"start": 0.0, "end": 20.0, "text": "这个很重要" * 2_000, "language": "Chinese"}]],
+        fail_asr_on_call=2,
+    )
+    monkeypatch.setattr("voxis.run.load_audio_file", _fake_loaded_audio(tmp_path, duration_seconds=20.0))
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--debug"]) == 1
+
+    assert "ASR degenerate segment retry failed" in capsys.readouterr().err
+    progress = [
+        json.loads(line) for line in (out / "_debug" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    failed = next(event for event in progress if event.get("reason") == "degenerate_segment")
+    assert failed["retry_error_type"] == "RuntimeError"
+    assert failed["retry_error_message"] == "ASR provider retry failed"
+
+
+@pytest.mark.parametrize("loop", ["对的", "这个很重要"])
+def test_segment_degeneration_gate_detects_repeated_sequences(loop: str) -> None:
+    text = loop * ((40_000 // len(loop)) + 1)
+
+    metrics = asr._segment_degeneration_metrics({"start": 0.0, "end": 64.718, "text": text[:40_000]})
+
+    assert metrics["chars_per_second"] > 600.0
+    assert metrics["repeated_sequence_unit_chars"] >= len(loop)
+    assert metrics["repeated_sequence_coverage"] >= 0.99
+    assert metrics["suspect"] is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            "欢迎来到高能量，我是李翔。然后这一期我们是接着和李峰峰叔做宏观漫谈。可能上一期的节目大家也已经听到了，峰叔刚跟我说他有进一步搞明白了其中一些上一次还没有特别搞明白的地方。"
+            "过程中间因为我们聊的时候，已经对富途和老虎这样的机构发了一个监管的新政策。国务院又发了一个包括个人在内的对外投资规定。我当时也比较困惑，到底这些政策的连续性和起因是什么。"
+            "通常国家出台特定政策，今天还不能叫法律，因为它其实是国务院关于个人和机构对海外进行投资的规定。这里边有几个事情非常重要，也解释了我之前的一些困惑。第一个是从现象来看比较少见，因为这是国务院发的。"
+            "以前这种执行通知几乎都是所属部门，比如发改委、经管局、银监会、证监会等机构来发对应通知。这次用了国务院统筹，几乎所有相关单位都由国务院进行发布。通常在法律或媒体解释上，它被称为上位法。"
+            "简单来讲，最上层机构做了约束的方向和框架，然后具体的司、部、委再对各自管辖范围如何执行上位政策进行细则颁布。现在由最高政府执行单位对整件事情的方向和趋势做出规范和约束，并确定边界。"
+            "范围既包括个人，也包括企业和相关实体，约束的是海外投资。这解释了很多小的迹象，有些跟行业相关，有些跟大家看到的新闻现象有关。过去两年很多件事都跟这个有关系。"
+            "当全社会讨论恒大地产问题时，有一个炒得沸沸扬扬的新闻，关于海外家族信托是否参与赔偿和是否会被击穿。中国境内个人的海外信托涉及很多问题，比如钱是怎么出境的，因为什么来的。"
+            "这些钱是通过正规途径出境，还是通过真实或虚拟的海外投资转成。另一个新闻事件是娃哈哈家族信托的问题。当时讨论的背景，是信托会不会参与欠款、分家产的赔偿和支付。"
+            "从政策层面往回追溯，关心的是这些钱如何形成、如何出境，以及以什么目的和方式出境。第二波事情跟股权投资行业有关，因为行业里有三十七号文，也就是外管局登记。"
+            "人民币股权投资之所以跟境外投资有关，是因为人民币基金投资海外企业并持有股权时，需要人民币换汇出境。这个过程涉及备案审批，也包括 ODI，也就是海外直接投资。"
+            "今年初有一个窗口指导，通知从二三年开始还没有办完的 ODI 程序暂停，同时说明不是以后都暂停，而是因为可能有政策要颁布，具体规定还不确定。"
+            "当时收到的说明是，政策如何规定还没有完全确定，所以先暂停执行尚未办完的程序。这个窗口指导和后来发布的整体规定彼此对应，也说明相关准备并不是一天两天形成的。"
+            "从行业角度看，真正需要判断的是后续细则如何落地、不同审批单位怎样执行，以及个人和企业在新的边界下分别需要准备哪些材料。"
+        ),
+        (
+            "And what's going on? He said the following: If you are on stage or in an interview and talking "
+            "about something, you should know that topic inside out already. The only thing you should ever be "
+            "talking about is something you know intimately. If you know it intimately, you should be able to "
+            "talk about it in a viscerally interesting way that relays your thoughts, and you ought to come "
+            "across as an interesting person because it is like sitting across the table talking to a friend. "
+            "His training is one hundred percent about getting you to stop doing the other rehearsed material "
+            "and become able to do that. The other part is that you assume the media is adversarial. He called "
+            "the next technique the pivot, which means you do not answer a bad question directly; you answer "
+            "the useful question you came to discuss. That can make an interview feel unnatural, but natural "
+            "conversation also means refusing a false premise and substituting a better framing. We have watched "
+            "the evolution of the new media landscape for thirty years. If you watch Palmer Luckey, Alex Karp, "
+            "Elon Musk, or any of the strongest communicators, that is what they are doing. They know the subject, "
+            "choose the useful question, explain the evidence, and keep the conversation grounded in what they "
+            "can actually defend. This is not memorizing a slogan. It is understanding the material well enough "
+            "to move between examples, objections, history, incentives, and consequences without losing the main "
+            "argument. A prepared speaker can still sound spontaneous because preparation supplies knowledge, "
+            "not a rigid script. The interviewer may change direction, introduce a misleading assumption, or ask "
+            "for a prediction that cannot be supported. The speaker then has to identify the real issue, explain "
+            "why the premise is incomplete, and offer a precise answer to the question that matters. That is the "
+            "difference between evasion and a useful pivot: one hides from evidence, while the other redirects the "
+            "conversation toward evidence the audience can evaluate."
+        ),
+    ],
+)
+def test_segment_degeneration_gate_keeps_corpus_derived_high_density_text(text: str) -> None:
+    duration = len(text.strip()) / 30.0
+
+    metrics = asr._segment_degeneration_metrics({"start": 0.0, "end": duration, "text": text})
+
+    assert metrics["text_chars"] >= asr.DEGENERATION_MIN_TEXT_CHARS
+    assert metrics["chars_per_second"] == pytest.approx(30.0)
+    assert metrics["repeated_sequence_coverage"] < asr.DEGENERATION_MIN_REPEATED_SEQUENCE_COVERAGE
+    assert metrics["suspect"] is False
+
+
 def test_transcribe_offsets_aligned_words_by_segment_start(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     install_fake_mlx(
         monkeypatch,
@@ -997,6 +1286,7 @@ def install_fake_mlx(
     words: tuple[str, ...] = ("Hello",),
     word_starts: tuple[float, ...] | None = None,
     asr_outputs: list[list[dict[str, Any]]] | None = None,
+    fail_asr_on_call: int | None = None,
 ) -> dict[str, Any]:
     asr._load_asr_model.cache_clear()
     asr._load_aligner_model.cache_clear()
@@ -1019,6 +1309,9 @@ def install_fake_mlx(
         def generate(self, waveform: object, **kwargs: object) -> FakeAsrOutput:
             calls["asr"] = kwargs
             calls.setdefault("asr_calls", []).append(kwargs)
+            calls.setdefault("asr_waveform_lengths", []).append(len(cast(Any, waveform)))
+            if fail_asr_on_call == len(calls["asr_calls"]):
+                raise RuntimeError("ASR provider retry failed")
             output_index = min(len(calls["asr_calls"]) - 1, len(asr_output_sets) - 1)
             return FakeAsrOutput(asr_output_sets[output_index])
 
@@ -1036,6 +1329,7 @@ def install_fake_mlx(
     class FakeAlignerModel:
         def generate(self, **kwargs: object) -> FakeAlignOutput | list[FakeAlignOutput]:
             calls["aligner"] = kwargs
+            calls.setdefault("aligner_calls", []).append(kwargs)
             if fail_alignment:
                 raise RuntimeError("aligner failed")
             if aligner_returns_list:
@@ -1053,3 +1347,16 @@ def install_fake_mlx(
     monkeypatch.setitem(sys.modules, "mlx_audio.stt", types.ModuleType("mlx_audio.stt"))
     monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", utils)
     return calls
+
+
+def _fake_loaded_audio(tmp_path: Path, *, duration_seconds: float) -> Any:
+    def load(path: Path, *, sample_rate_hz: int) -> LoadedAudio:
+        del path
+        return LoadedAudio(
+            path=tmp_path / "sample.wav",
+            sample_rate_hz=sample_rate_hz,
+            waveform=np.zeros(round(duration_seconds * sample_rate_hz), dtype=np.float32),
+            duration_s=duration_seconds,
+        )
+
+    return load

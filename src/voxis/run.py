@@ -251,6 +251,7 @@ def _run_asr_and_diarization(
                 language=options.language,
                 config=config,
                 progress=progress.event,
+                require_complete_alignment=False,
             ),
             None,
         )
@@ -260,6 +261,7 @@ def _run_asr_and_diarization(
         language=options.language,
         config=config,
         progress=progress.event,
+        require_complete_alignment=True,
     )
     progress.event("diarization", "started")
     try:
@@ -312,6 +314,7 @@ def _write_debug(
                 "segments": asr_result.segments,
                 "words": asr_result.words,
                 "alignment_errors": asr_result.alignment_errors,
+                "degeneration_retries": asr_result.degeneration_retries,
             },
             ensure_ascii=False,
             indent=2,
