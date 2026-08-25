@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+- Fail closed when speaker mapping contradicts a directly observed guest welcome and acknowledgment,
+  preserving debug evidence without writing trusted transcript outputs
+
 ## [0.1.0] - 2026-07-18
 
 Initial public release.

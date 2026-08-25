@@ -1,11 +1,194 @@
 from __future__ import annotations
 
+import pytest
 from pytest import MonkeyPatch
 
 from voxis.config import VoxisConfig
 from voxis.diarization_types import Turn
 from voxis.llm import LLMResponse
-from voxis.speaker_map import apply_speaker_map_to_turns, build_speaker_map, speaker_map_payload
+from voxis.speaker_map import (
+    ROLE_INTRODUCTION_FAILURE_KIND,
+    apply_speaker_map_to_turns,
+    build_speaker_map,
+    detect_role_introductions,
+    speaker_map_payload,
+)
+
+
+@pytest.mark.parametrize(
+    ("context", "welcome", "ack", "addressed_name", "target_cluster"),
+    [
+        (
+            "Title: Martin Casado on Where the Value Is Going in AI",
+            "Hello everyone. Martin, welcome to MTS",
+            "Super happy to be here. Thanks for having me.",
+            "Martin Casado",
+            "SPEAKER_02",
+        ),
+        (
+            "Title: Michael Kratsios: Science Agenda",
+            "Michael Kratsios, welcome to the interview",
+            "Thank you for having me. Excited to be here.",
+            "Michael Kratsios",
+            "SPEAKER_01",
+        ),
+    ],
+)
+def test_detect_role_introductions_finds_audited_production_cases(
+    context: str,
+    welcome: str,
+    ack: str,
+    addressed_name: str,
+    target_cluster: str,
+) -> None:
+    evidence = detect_role_introductions(
+        [
+            Turn("SPEAKER_00", 0.0, 4.0, welcome),
+            Turn(target_cluster, 4.1, 6.0, ack),
+        ],
+        context=context,
+    )
+
+    assert evidence == [
+        {
+            "welcome_turn_index": 0,
+            "ack_turn_index": 1,
+            "addressed_name": addressed_name,
+            "welcoming_cluster": "SPEAKER_00",
+            "target_cluster": target_cluster,
+            "welcome_phrase": "welcome to",
+            "ack_phrase": "happy to be here" if addressed_name == "Martin Casado" else "Thank you for having me",
+            "gap_seconds": 0.1,
+            "welcome_excerpt": welcome,
+            "ack_excerpt": ack,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("context", "turns"),
+    [
+        (
+            None,
+            [
+                Turn("SPEAKER_00", 0.0, 1.0, "Alice, welcome to the show"),
+                Turn("SPEAKER_01", 1.0, 2.0, "Thanks for having me"),
+            ],
+        ),
+        (
+            "Guests: Alice Smith and Alice Jones",
+            [
+                Turn("SPEAKER_00", 0.0, 1.0, "Alice, welcome to the show"),
+                Turn("SPEAKER_01", 1.0, 2.0, "Thanks for having me"),
+            ],
+        ),
+        (
+            "Guest: Alice Smith",
+            [
+                Turn("SPEAKER_00", 0.0, 1.0, "In this clip Alice says welcome to the show"),
+                Turn("SPEAKER_01", 1.0, 2.0, "Thanks for having me"),
+            ],
+        ),
+        (
+            "Guest: Alice Smith",
+            [
+                Turn("SPEAKER_00", 0.0, 1.0, "Alice, welcome to the show"),
+                Turn(
+                    "SPEAKER_01",
+                    1.0,
+                    2.0,
+                    "Before we start, the trailer ends with someone saying thank you for having me, then fades out",
+                ),
+            ],
+        ),
+        (
+            "Guest: Alice Smith",
+            [
+                Turn("SPEAKER_00", 0.0, 1.0, "Alice, welcome to the show"),
+                Turn("SPEAKER_00", 1.0, 2.0, "Thanks for having me"),
+            ],
+        ),
+        (
+            "Guest: Alice Smith",
+            [
+                Turn("SPEAKER_00", 0.0, 1.0, "Alice, welcome to the show"),
+                Turn("SPEAKER_01", 4.0, 5.0, "Thanks for having me"),
+            ],
+        ),
+        (
+            "Guest: Alice Smith",
+            [
+                Turn("SPEAKER_00", 0.0, 1.0, "Alice, welcome to the show"),
+                Turn("SPEAKER_01", 1.0, 2.0, "Let us begin with the topic"),
+            ],
+        ),
+    ],
+)
+def test_detect_role_introductions_rejects_ambiguous_or_weak_evidence(
+    context: str | None,
+    turns: list[Turn],
+) -> None:
+    assert detect_role_introductions(turns, context=context) == []
+
+
+def test_build_speaker_map_fails_closed_on_role_introduction_conflict(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "voxis.speaker_map.call_json_schema_llm",
+        lambda *args, **kwargs: LLMResponse(
+            '{"mapping":{"SPEAKER_00":"Michael Kratsios","SPEAKER_01":null}}',
+            elapsed_seconds=0.2,
+            prompt_tokens=11,
+            completion_tokens=7,
+        ),
+    )
+    turns = [
+        Turn("SPEAKER_00", 0.0, 4.0, "Michael Kratsios, welcome to the interview"),
+        Turn("SPEAKER_01", 4.1, 8.0, "Thank you for having me. Excited to be here."),
+    ]
+
+    result = build_speaker_map(turns, context="Title: Michael Kratsios: Science Agenda", config=make_config())
+
+    assert result.status == "failed"
+    assert result.failure_kind == ROLE_INTRODUCTION_FAILURE_KIND
+    assert result.mapping == {
+        "SPEAKER_00": "Michael Kratsios",
+        "SPEAKER_01": "Unknown (SPEAKER_01)",
+    }
+    assert [issue["code"] for issue in result.issues] == ["ROLE_INTRODUCTION_CONFLICT"]
+    assert result.issues[0]["value"]["reasons"] == [
+        "target_cluster_name_mismatch",
+        "welcoming_cluster_claims_guest",
+    ]
+    payload = speaker_map_payload(result)
+    assert payload["role_introduction"]["conflict_count"] == 1
+    assert payload["role_introduction"]["evidence"] == result.role_introduction_evidence
+
+
+def test_build_speaker_map_accepts_consistent_role_introduction(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "voxis.speaker_map.call_json_schema_llm",
+        lambda *args, **kwargs: LLMResponse(
+            '{"mapping":{"SPEAKER_00":"Brett Winton","SPEAKER_01":"Dylan Robbins"}}',
+            elapsed_seconds=0.2,
+            prompt_tokens=11,
+            completion_tokens=7,
+        ),
+    )
+    turns = [
+        Turn("SPEAKER_00", 0.0, 4.0, "Dylan, welcome to the pod"),
+        Turn("SPEAKER_01", 4.1, 8.0, "Doing great. Thanks for having me."),
+    ]
+
+    result = build_speaker_map(
+        turns,
+        context="Host: Brett Winton. Guest: Dylan Robbins.",
+        config=make_config(),
+    )
+
+    assert result.status == "succeeded"
+    assert result.failure_kind is None
+    assert result.mapping == {"SPEAKER_00": "Brett Winton", "SPEAKER_01": "Dylan Robbins"}
+    assert result.role_introduction_evidence[0]["addressed_name"] == "Dylan Robbins"
 
 
 def test_build_speaker_map_fails_when_probe_speaker_is_omitted(monkeypatch: MonkeyPatch) -> None:
