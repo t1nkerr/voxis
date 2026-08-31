@@ -43,6 +43,7 @@ ROLE_INTRODUCTION_QUOTED_OR_CLIP_CUE_RE = re.compile(
     r"\b(?:ad|advertisement|clip|quote|quoted|said|says|trailer)\b",
     re.IGNORECASE,
 )
+CONTEXT_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 
 SPEAKER_MAP_PROMPT = """Map diarization cluster IDs to visible speaker names.
 
@@ -386,7 +387,8 @@ def _address_before_welcome(
 
 
 def _resolve_context_name(context: str, address: str) -> str | None:
-    if not _context_contains_name(context, address):
+    sanitized_context = CONTEXT_URL_RE.sub(" ", context)
+    if not _context_contains_name(sanitized_context, address):
         return None
     if " " in address:
         return address
@@ -394,7 +396,7 @@ def _resolve_context_name(context: str, address: str) -> str | None:
         match.group(0).rstrip(".,;:!?")
         for match in re.finditer(
             rf"(?<!\w){re.escape(address)}\s+[A-Z][A-Za-z.'-]+(?!\w)",
-            context,
+            sanitized_context,
         )
     }
     exact_case = {candidate for candidate in candidates if candidate.split()[0].lower() == address.lower()}
@@ -402,7 +404,7 @@ def _resolve_context_name(context: str, address: str) -> str | None:
         return next(iter(exact_case))
     if exact_case:
         return None
-    return address
+    return None
 
 
 def _context_contains_name(context: str, name: str) -> bool:

@@ -122,6 +122,20 @@ def test_detect_role_introductions_finds_audited_production_cases(
                 Turn("SPEAKER_01", 1.0, 2.0, "Let us begin with the topic"),
             ],
         ),
+        (
+            "Newsletter: https://creatoreconomy.so/p/vibe-coding. Guest: Amol Jain.",
+            [
+                Turn("SPEAKER_00", 0.0, 1.0, "So welcome sir"),
+                Turn("SPEAKER_01", 1.1, 2.0, "Thank Peter. Great to be here."),
+            ],
+        ),
+        (
+            "The summary says so in ordinary prose. Guest: Amol Jain.",
+            [
+                Turn("SPEAKER_00", 0.0, 1.0, "So welcome sir"),
+                Turn("SPEAKER_01", 1.1, 2.0, "Thank Peter. Great to be here."),
+            ],
+        ),
     ],
 )
 def test_detect_role_introductions_rejects_ambiguous_or_weak_evidence(
