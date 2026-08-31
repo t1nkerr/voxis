@@ -35,7 +35,6 @@ from voxis.diarization_types import (
 )
 from voxis.polish import PolishResult, polish_turns, render_user_facing_polished_text
 from voxis.speaker_map import (
-    ROLE_INTRODUCTION_FAILURE_KIND,
     SpeakerMapResult,
     apply_speaker_map_to_turns,
     build_speaker_map,
@@ -146,20 +145,6 @@ def transcribe(options: TranscribeOptions, config: VoxisConfig) -> int:
             )
         else:
             speaker_map_result = None
-        if speaker_map_result is not None and speaker_map_result.failure_kind == ROLE_INTRODUCTION_FAILURE_KIND:
-            if options.debug:
-                _write_debug(
-                    out_dir / "_debug",
-                    asr_result,
-                    diarize_enabled=options.diarize,
-                    diarization_result=diarization_result,
-                    policy_result=policy_result,
-                    pre_policy_turns=pre_policy_turns,
-                    raw_turns=raw_turns,
-                    speaker_map_result=speaker_map_result,
-                    polish_result=None,
-                )
-            raise RuntimeError("speaker map contradicts explicit role-introduction evidence")
         speaker_map_failed = speaker_map_result is not None and speaker_map_result.status == "failed"
         if speaker_map_result is not None and speaker_map_result.status == "failed":
             progress.event(

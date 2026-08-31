@@ -121,12 +121,6 @@ The final `transcript.md` still renders user-facing timestamps as `[HH:MM:SS]`.
 
 Polish runs in chunks. Hard-failed chunks fall back to original timestamped turns; warning-only chunks are kept and logged.
 
-Speaker mapping also validates narrow role-introduction evidence. When one cluster welcomes a
-context-listed guest and the next cluster immediately acknowledges the welcome, the guest cluster must
-map to that name and the welcoming cluster must not. A contradiction fails the run instead of using the
-ordinary unmapped-speaker fallback. With `--debug`, the ASR, diarization, speaker-map evidence, conflict,
-and terminal progress event remain available; `transcript.md` and `run.json` are not written.
-
 Optional, only when `--debug` is used:
 
 ```text

@@ -19,31 +19,9 @@ SPEAKER_MAP_TOKENS_PER_SPEAKER = 64
 SPEAKER_MAP_RESPONSE_EXCERPT_CHARS = 500
 PROBE_INITIAL_TURNS = 10
 PROBE_FIRST_APPEARANCE_CONTEXT = 2
-ROLE_INTRODUCTION_POLICY_ID = "speaker_map_role_introduction_guard_v1"
-ROLE_INTRODUCTION_FAILURE_KIND = "role_introduction_conflict"
-ROLE_INTRODUCTION_MAX_GAP_SECONDS = 2.5
-ROLE_INTRODUCTION_MIN_ACK_WORDS = 3
-ROLE_INTRODUCTION_MAX_ACK_PREFIX_CHARS = 32
 SPEAKER_LABEL_RE = re.compile(r"SPEAKER_\d+")
 UNKNOWN_SPEAKER_RE = re.compile(r"^Unknown \(SPEAKER_\d+\)$")
 GENERIC_UNKNOWN_PLACEHOLDERS = {"unknown", "unknown speaker", "n/a", "na", "none", "null"}
-ROLE_INTRODUCTION_WELCOME_RE = re.compile(
-    r"(?P<phrase>welcome(?:\s+back|\s+to|\b)|thanks?\s+for\s+joining|great\s+to\s+have\s+you)",
-    re.IGNORECASE,
-)
-ROLE_INTRODUCTION_ADDRESS_SUFFIX_RE = re.compile(r"(?P<name>[A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*){0,3})\s*,?\s*$")
-ROLE_INTRODUCTION_ACK_RE = re.compile(
-    r"(?P<phrase>thank\s+you\s+for\s+(?:having|inviting)\s+me|"
-    r"thanks\s+for\s+(?:having|inviting)\s+me|"
-    r"(?:happy|glad|excited|pleased|great)\s+to\s+be\s+here|"
-    r"pleasure\s+to\s+be\s+here)",
-    re.IGNORECASE,
-)
-ROLE_INTRODUCTION_QUOTED_OR_CLIP_CUE_RE = re.compile(
-    r"\b(?:ad|advertisement|clip|quote|quoted|said|says|trailer)\b",
-    re.IGNORECASE,
-)
-CONTEXT_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 
 SPEAKER_MAP_PROMPT = """Map diarization cluster IDs to visible speaker names.
 
@@ -84,7 +62,6 @@ class SpeakerMapResult:
     all_turn_speakers: list[str]
     issues: list[dict[str, Any]]
     probe_turns: list[dict[str, Any]]
-    role_introduction_evidence: list[dict[str, Any]]
     model: str | None = None
     prompt_template_id: str | None = None
     prompt_sha256: str | None = None
@@ -113,14 +90,8 @@ def build_speaker_map(
     probe_speakers = _speaker_labels_from_turns(probe_turns)
     all_turn_speakers = _speaker_labels_from_turns(turns)
     stripped_context = (context or "").strip()
-    role_introduction_evidence = detect_role_introductions(turns, context=stripped_context)
     if not all_turn_speakers:
-        return _skipped(
-            "skipped_no_speakers",
-            probe_speakers=probe_speakers,
-            all_turn_speakers=all_turn_speakers,
-            role_introduction_evidence=role_introduction_evidence,
-        )
+        return _skipped("skipped_no_speakers", probe_speakers=probe_speakers, all_turn_speakers=all_turn_speakers)
     evidence_mode = "context_and_probe" if stripped_context else "probe_only"
     if config.llm_api_key is None:
         return _skipped(
@@ -128,7 +99,6 @@ def build_speaker_map(
             probe_speakers=probe_speakers,
             all_turn_speakers=all_turn_speakers,
             evidence_mode=evidence_mode,
-            role_introduction_evidence=role_introduction_evidence,
         )
 
     prompt = SPEAKER_MAP_PROMPT.format(context=stripped_context, probe=_turns_to_text(probe_turns))
@@ -166,7 +136,6 @@ def build_speaker_map(
                     }
                 ],
                 probe_turns=_probe_turns_payload(probe),
-                role_introduction_evidence=role_introduction_evidence,
                 model=config.speaker_map_model,
                 prompt_template_id=SPEAKER_MAP_PROMPT_TEMPLATE_ID,
                 prompt_sha256=sha256_text(prompt),
@@ -195,26 +164,15 @@ def build_speaker_map(
         evidence_text=f"{stripped_context}\n{_turns_to_text(probe_turns)}",
         base_issues=base_issues,
     )
-    base_status = _status_from_speaker_map(raw_mapping=raw_mapping, issues=issues)
-    role_introduction_issues = (
-        _role_introduction_conflicts(mapping, role_introduction_evidence) if base_status != "failed" else []
-    )
-    issues.extend(role_introduction_issues)
     status = _status_from_speaker_map(raw_mapping=raw_mapping, issues=issues)
-    failure_kind = None
-    if role_introduction_issues:
-        failure_kind = ROLE_INTRODUCTION_FAILURE_KIND
-    elif status == "failed":
-        failure_kind = "invalid_output"
     return SpeakerMapResult(
         status=status,
-        failure_kind=failure_kind,
+        failure_kind="invalid_output" if status == "failed" else None,
         mapping=mapping,
         probe_speakers=probe_speakers,
         all_turn_speakers=all_turn_speakers,
         issues=issues,
         probe_turns=_probe_turns_payload(probe),
-        role_introduction_evidence=role_introduction_evidence,
         model=config.speaker_map_model,
         prompt_template_id=SPEAKER_MAP_PROMPT_TEMPLATE_ID,
         prompt_sha256=sha256_text(prompt),
@@ -249,11 +207,6 @@ def speaker_map_payload(result: SpeakerMapResult) -> dict[str, Any]:
         "probe_speakers": result.probe_speakers,
         "all_turn_speakers": result.all_turn_speakers,
         "probe_turns": result.probe_turns,
-        "role_introduction": {
-            "policy_id": ROLE_INTRODUCTION_POLICY_ID,
-            "evidence": result.role_introduction_evidence,
-            "conflict_count": sum(issue.get("code") == "ROLE_INTRODUCTION_CONFLICT" for issue in result.issues),
-        },
         "model": result.model,
         "prompt_template_id": result.prompt_template_id,
         "prompt_sha256": result.prompt_sha256,
@@ -285,10 +238,6 @@ def speaker_map_provider_payload(result: SpeakerMapResult | None, *, enabled: bo
         "completion_tokens": result.completion_tokens,
         "mapping_count": len(result.mapping),
         "issue_count": len(result.issues),
-        "role_introduction_evidence_count": len(result.role_introduction_evidence),
-        "role_introduction_conflict_count": sum(
-            issue.get("code") == "ROLE_INTRODUCTION_CONFLICT" for issue in result.issues
-        ),
     }
 
 
@@ -298,7 +247,6 @@ def _skipped(
     probe_speakers: list[str],
     all_turn_speakers: list[str],
     evidence_mode: str | None = None,
-    role_introduction_evidence: list[dict[str, Any]] | None = None,
 ) -> SpeakerMapResult:
     return SpeakerMapResult(
         status=status,
@@ -308,151 +256,12 @@ def _skipped(
         all_turn_speakers=all_turn_speakers,
         issues=[],
         probe_turns=[],
-        role_introduction_evidence=list(role_introduction_evidence or []),
         evidence_mode=evidence_mode,
     )
 
 
 def _thinking_enabled_receipt(config: VoxisConfig) -> bool | None:
     return False if config.llm_disable_thinking else None
-
-
-def detect_role_introductions(turns: list[Turn], *, context: str | None) -> list[dict[str, Any]]:
-    stripped_context = (context or "").strip()
-    if not stripped_context:
-        return []
-    evidence: list[dict[str, Any]] = []
-    for index, welcome_turn in enumerate(turns[:-1]):
-        for welcome_match in ROLE_INTRODUCTION_WELCOME_RE.finditer(welcome_turn.text):
-            addressed_name = _address_before_welcome(
-                welcome_turn.text,
-                welcome_match,
-                context=stripped_context,
-            )
-            if addressed_name is None:
-                continue
-            ack_turn = turns[index + 1]
-            if ack_turn.speaker == welcome_turn.speaker:
-                continue
-            gap_seconds = round(ack_turn.start - welcome_turn.end, 3)
-            if gap_seconds < -0.25 or gap_seconds > ROLE_INTRODUCTION_MAX_GAP_SECONDS:
-                continue
-            if len(ack_turn.text.split()) < ROLE_INTRODUCTION_MIN_ACK_WORDS:
-                continue
-            ack_match = ROLE_INTRODUCTION_ACK_RE.search(ack_turn.text)
-            if ack_match is None:
-                continue
-            ack_prefix = ack_turn.text[: ack_match.start()]
-            if len(ack_prefix) > ROLE_INTRODUCTION_MAX_ACK_PREFIX_CHARS:
-                continue
-            if ROLE_INTRODUCTION_QUOTED_OR_CLIP_CUE_RE.search(ack_prefix):
-                continue
-            evidence.append(
-                {
-                    "welcome_turn_index": index,
-                    "ack_turn_index": index + 1,
-                    "addressed_name": addressed_name,
-                    "welcoming_cluster": welcome_turn.speaker,
-                    "target_cluster": ack_turn.speaker,
-                    "welcome_phrase": welcome_match.group("phrase"),
-                    "ack_phrase": ack_match.group("phrase"),
-                    "gap_seconds": gap_seconds,
-                    "welcome_excerpt": welcome_turn.text[:400],
-                    "ack_excerpt": ack_turn.text[:400],
-                }
-            )
-    return evidence
-
-
-def _address_before_welcome(
-    text: str,
-    match: re.Match[str],
-    *,
-    context: str,
-) -> str | None:
-    prefix = text[: match.start()]
-    suffix_match = ROLE_INTRODUCTION_ADDRESS_SUFFIX_RE.search(prefix)
-    if suffix_match is None:
-        return None
-    cue_window = prefix[max(0, suffix_match.start() - 80) : suffix_match.start()]
-    if ROLE_INTRODUCTION_QUOTED_OR_CLIP_CUE_RE.search(cue_window):
-        return None
-    tokens = suffix_match.group("name").split()
-    for start in range(len(tokens)):
-        candidate = " ".join(tokens[start:])
-        resolved = _resolve_context_name(context, candidate)
-        if resolved is not None:
-            return resolved
-    return None
-
-
-def _resolve_context_name(context: str, address: str) -> str | None:
-    sanitized_context = CONTEXT_URL_RE.sub(" ", context)
-    if not _context_contains_name(sanitized_context, address):
-        return None
-    if " " in address:
-        return address
-    candidates = {
-        match.group(0).rstrip(".,;:!?")
-        for match in re.finditer(
-            rf"(?<!\w){re.escape(address)}\s+[A-Z][A-Za-z.'-]+(?!\w)",
-            sanitized_context,
-        )
-    }
-    exact_case = {candidate for candidate in candidates if candidate.split()[0].lower() == address.lower()}
-    if len(exact_case) == 1:
-        return next(iter(exact_case))
-    if exact_case:
-        return None
-    return None
-
-
-def _context_contains_name(context: str, name: str) -> bool:
-    return re.search(rf"(?<!\w){re.escape(name)}(?!\w)", context, re.IGNORECASE) is not None
-
-
-def _role_introduction_conflicts(
-    mapping: dict[str, str],
-    evidence: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    issues: list[dict[str, Any]] = []
-    for receipt in evidence:
-        addressed_name = str(receipt["addressed_name"])
-        target_cluster = str(receipt["target_cluster"])
-        welcoming_cluster = str(receipt["welcoming_cluster"])
-        target_mapping = mapping.get(target_cluster)
-        welcoming_mapping = mapping.get(welcoming_cluster)
-        reasons = []
-        if not _same_real_name(target_mapping, addressed_name):
-            reasons.append("target_cluster_name_mismatch")
-        if _same_real_name(welcoming_mapping, addressed_name):
-            reasons.append("welcoming_cluster_claims_guest")
-        if not reasons:
-            continue
-        issues.append(
-            {
-                "code": "ROLE_INTRODUCTION_CONFLICT",
-                "severity": "error",
-                "detail": "speaker map contradicts explicit welcome and acknowledgment evidence",
-                "speaker": target_cluster,
-                "value": {
-                    "reasons": reasons,
-                    "addressed_name": addressed_name,
-                    "target_cluster": target_cluster,
-                    "target_mapping": target_mapping,
-                    "welcoming_cluster": welcoming_cluster,
-                    "welcoming_mapping": welcoming_mapping,
-                    "evidence": receipt,
-                },
-            }
-        )
-    return issues
-
-
-def _same_real_name(value: str | None, expected: str) -> bool:
-    if value is None or UNKNOWN_SPEAKER_RE.fullmatch(value):
-        return False
-    return value.casefold() == expected.casefold()
 
 
 def _speaker_map_probe(turns: list[Turn]) -> list[_ProbeTurn]:
