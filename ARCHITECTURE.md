@@ -68,7 +68,7 @@ Machine setup:
   and chooses the English or Chinese post-assignment policy profile. Explicit `--language en|zh` overrides
   ASR-detected language for both ASR and policy routing.
 - Speaker mapping: JSON schema mode on code default model `deepseek-v4-flash`.
-- Polish: OpenAI-compatible chat endpoint on code default model `deepseek-v4-flash`.
+- Polish: OpenAI-compatible chat endpoint on code default model `qwen3.8-flash`.
   - Default base URL: `https://dashscope.aliyuncs.com/compatible-mode/v1` (override with `VOXIS_LLM_BASE_URL`).
   - `enable_thinking=false` is sent only to DashScope endpoints unless `VOXIS_LLM_DISABLE_THINKING` overrides it.
   - Polish chunks run with bounded concurrency using the code default worker cap.

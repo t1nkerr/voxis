@@ -10,7 +10,7 @@ def test_load_config_uses_bailian_defaults_without_file() -> None:
 
     assert config.llm_api_key is None
     assert config.llm_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    assert config.polish_model == "deepseek-v4-flash"
+    assert config.polish_model == "qwen3.8-flash"
     assert config.speaker_map_model == "deepseek-flash"
     assert config.polish_max_workers == 20
 
@@ -26,7 +26,7 @@ def test_load_config_reads_only_secret_from_environment_over_file(tmp_path: Path
 
     assert config.llm_api_key == "env-key"
     assert config.llm_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    assert config.polish_model == "deepseek-v4-flash"
+    assert config.polish_model == "qwen3.8-flash"
     assert config.speaker_map_model == "deepseek-flash"
     assert config.polish_max_workers == 20
 
@@ -137,7 +137,7 @@ def test_speaker_provider_is_separate_from_polish(tmp_path: Path) -> None:
     )
     assert config.llm_api_key == "shared"
     assert "dashscope" in config.llm_base_url
-    assert config.polish_model == "deepseek-v4-flash"
+    assert config.polish_model == "qwen3.8-flash"
     assert config.speaker_map_base_url == "https://api.deepseek.com"
     assert config.speaker_map_api_key == "speaker"
     assert config.speaker_map_reasoning_effort == "low"

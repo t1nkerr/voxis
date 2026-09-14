@@ -640,4 +640,4 @@ def test_dedicated_deepseek_request_has_no_cap_and_preserves_polish(monkeypatch:
     assert result.mapping == {"SPEAKER_00": "Peter Yang"}
     assert result.thinking_enabled is True
     assert config.llm_api_key == "shared"
-    assert config.polish_model == "deepseek-v4-flash"
+    assert config.polish_model == "qwen3.8-flash"
