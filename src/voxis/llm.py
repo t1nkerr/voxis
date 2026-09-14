@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
@@ -32,7 +33,7 @@ def call_llm(
     *,
     config: VoxisConfig,
     model: str | None = None,
-    max_tokens: int = 65_536,
+    max_tokens: int | None = 65_536,
     response_format: Mapping[str, object] | None = None,
     extra_body: Mapping[str, object] | None = None,
 ) -> LLMResponse:
@@ -44,8 +45,9 @@ def call_llm(
         "model": model or config.polish_model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
-        "max_tokens": max_tokens,
     }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     if response_format is not None:
         kwargs["response_format"] = dict(response_format)
     if extra_body is not None:
@@ -88,21 +90,20 @@ def call_json_schema_llm(
     model: str,
     schema_name: str,
     schema: Mapping[str, object],
-    max_tokens: int = 4096,
+    max_tokens: int | None = 4096,
     extra_body: Mapping[str, object] | None = None,
 ) -> LLMResponse:
+    # Official DeepSeek Chat Completions supports JSON-object output, not JSON schema.
+    response_format: dict[str, object] = (
+        {"type": "json_object"}
+        if urlsplit(config.llm_base_url).hostname == "api.deepseek.com"
+        else {"type": "json_schema", "json_schema": {"name": schema_name, "strict": True, "schema": dict(schema)}}
+    )
     return call_llm(
         prompt,
         config=config,
         model=model,
         max_tokens=max_tokens,
         extra_body=extra_body,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "strict": True,
-                "schema": dict(schema),
-            },
-        },
+        response_format=response_format,
     )

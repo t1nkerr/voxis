@@ -117,3 +117,24 @@ def test_no_thinking_extra_body_respects_config() -> None:
         llm_disable_thinking=False,
     )
     assert no_thinking_extra_body(enabled) is None
+
+
+def test_deepseek_json_object_and_omitted_completion_cap(monkeypatch: MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    completions = FakeCompletions([])
+    monkeypatch.setattr("voxis.llm.OpenAI", lambda **kwargs: FakeOpenAIClient(completions))
+    config = replace(make_config(), llm_base_url="https://api.deepseek.com")
+    call_json_schema_llm(
+        "return JSON",
+        config=config,
+        model="deepseek-flash",
+        schema_name="map",
+        schema={},
+        max_tokens=None,
+        extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "low"},
+    )
+    kwargs = completions.call_kwargs[0]
+    assert "max_tokens" not in kwargs
+    assert kwargs["response_format"] == {"type": "json_object"}
+    assert kwargs["extra_body"]["reasoning_effort"] == "low"

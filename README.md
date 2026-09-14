@@ -99,16 +99,24 @@ voxis-bench run-sortformer --audio /path/to/short-audio.m4a --out /tmp/voxis-flu
 `~/.config/voxis/.env` holds machine-local secrets. Environment variables take precedence
 over file values.
 
-- `VOXIS_LLM_API_KEY`: API key for the OpenAI-compatible LLM endpoint used for ASR term
-  extraction, speaker-name mapping, and `--polish`. `BAILIAN_API_KEY` is also accepted.
-- `VOXIS_LLM_BASE_URL`, `VOXIS_POLISH_MODEL`, `VOXIS_SPEAKER_MAP_MODEL`,
-  `VOXIS_ASR_TERMS_MODEL`: optional provider overrides. Defaults target Alibaba
-  Bailian/DashScope. The endpoint must support OpenAI's strict JSON Schema response format;
-  transport compatibility alone is not sufficient for Voxis LLM features.
+- `VOXIS_LLM_API_KEY` (or `BAILIAN_API_KEY`): key for ASR term extraction and
+  `--polish`. Their shared endpoint defaults to Bailian/DashScope, with
+  `VOXIS_LLM_BASE_URL`, `VOXIS_POLISH_MODEL`, and `VOXIS_ASR_TERMS_MODEL` overrides.
+- `VOXIS_SPEAKER_MAP_API_KEY` (or `DEEPSEEK_API_KEY`): separate key for speaker-name
+  mapping. Mapping defaults to official `deepseek-flash` at `https://api.deepseek.com`,
+  with low thinking and no explicit completion-token cap. Provider defaults still apply.
+  `VOXIS_SPEAKER_MAP_MODEL` and `VOXIS_SPEAKER_MAP_BASE_URL` override that route.
+  The shared provider key is never reused for the speaker endpoint.
+- Official DeepSeek uses JSON-object output, with structural checks performed locally;
+  the shared Bailian route retains strict JSON Schema output. Mapping removes URL
+  destinations from its copy of show notes while preserving visible link labels.
+  Names absent verbatim from the input are retained with a diagnostic warning rather
+  than automatically replaced with Unknown; structural validation remains enforced.
 - `VOXIS_ASR_TERMS`: comma-separated glossary terms merged into every ASR prompt.
   Empty by default.
 - `VOXIS_LLM_DISABLE_THINKING`: `true`/`false` control for sending `enable_thinking=false`
-  to the LLM endpoint. Defaults to on for DashScope URLs, off otherwise.
+  to the shared ASR-term/polish endpoint. Defaults to on for DashScope URLs, off otherwise.
+  Speaker mapping uses its separate low-thinking configuration.
 
 ## Development
 

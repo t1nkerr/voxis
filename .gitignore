@@ -6,3 +6,7 @@
 __pycache__/
 review_artifacts/
 .DS_Store
+
+# Private benchmark corpora and generated runs
+bench-private/
+bench-runs/

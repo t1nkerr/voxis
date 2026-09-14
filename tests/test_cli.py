@@ -104,6 +104,7 @@ def test_transcribe_requires_diarize_for_polish(
     audio = tmp_path / "sample.wav"
     audio.write_bytes(b"fake audio")
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
 
     with pytest.raises(SystemExit) as exc_info:
         main(["transcribe", "--audio", str(audio), "--out", str(tmp_path / "out"), "--polish"])
@@ -115,6 +116,7 @@ def test_transcribe_requires_diarize_for_polish(
 def test_transcribe_passes_context_terms_and_language_to_asr(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     calls = install_fake_mlx(monkeypatch, aligner_returns_list=True)
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("VOXIS_ASR_TERMS", "Claude Code,Claude,Codex,OpenClaw,Kimi,Seedance")
     monkeypatch.setattr(
         "voxis.asr_terms.call_json_schema_llm",
@@ -177,6 +179,7 @@ def test_transcribe_trims_asr_prompt_echo_tail(tmp_path: Path, monkeypatch: Monk
         ],
     )
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("VOXIS_ASR_TERMS", "Claude Code,Claude,Codex,OpenClaw,Kimi,Seedance")
     monkeypatch.setattr(
         "voxis.asr_terms.call_json_schema_llm",
@@ -224,6 +227,7 @@ def test_transcribe_fails_when_asr_output_is_only_prompt_echo(
         ],
     )
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(
         "voxis.asr_terms.call_json_schema_llm",
         lambda prompt, *, config, model, schema_name, schema, max_tokens=2048, extra_body=None: LLMResponse(
@@ -305,6 +309,7 @@ def test_failed_run_removes_stale_outputs(
         ],
     )
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(
         "voxis.asr_terms.call_json_schema_llm",
         lambda prompt, *, config, model, schema_name, schema, max_tokens=2048, extra_body=None: LLMResponse(
@@ -735,6 +740,7 @@ def test_diarize_runs_probe_only_speaker_map_without_context(tmp_path: Path, mon
     install_fake_mlx(monkeypatch, words=("Alice", "speaks"))
     install_fake_diarize(monkeypatch, [DiarizeSpan(0.0, 1.0, "SPEAKER_00")])
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(
         "voxis.speaker_map.call_json_schema_llm",
         lambda prompt, *, config, model, schema_name, schema, max_tokens=2048, extra_body=None: LLMResponse(
@@ -784,6 +790,7 @@ def test_speaker_map_maps_names_before_transcript_output(tmp_path: Path, monkeyp
     install_fake_mlx(monkeypatch)
     install_fake_diarize(monkeypatch, [DiarizeSpan(0.0, 1.0, "SPEAKER_00")])
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(
         "voxis.speaker_map.call_json_schema_llm",
         lambda prompt, *, config, model, schema_name, schema, max_tokens=2048, extra_body=None: LLMResponse(
@@ -819,9 +826,9 @@ def test_speaker_map_maps_names_before_transcript_output(tmp_path: Path, monkeyp
     speaker_map = json.loads((out / "_debug" / "speaker_map.json").read_text(encoding="utf-8"))
     assert transcript == "# Transcript\n\n[00:00:00] Alice: Hello\n"
     assert run["providers"]["speaker_map"]["status"] == "succeeded"
-    assert run["providers"]["speaker_map"]["thinking_enabled"] is False
+    assert run["providers"]["speaker_map"]["thinking_enabled"] is True
     assert speaker_map["mapping"] == {"SPEAKER_00": "Alice"}
-    assert speaker_map["thinking_enabled"] is False
+    assert speaker_map["thinking_enabled"] is True
 
 
 def test_duplicate_speaker_map_names_succeed_with_warning(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -835,6 +842,7 @@ def test_duplicate_speaker_map_names_succeed_with_warning(tmp_path: Path, monkey
         ],
     )
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(
         "voxis.speaker_map.call_json_schema_llm",
         lambda prompt, *, config, model, schema_name, schema, max_tokens=2048, extra_body=None: LLMResponse(
@@ -894,7 +902,7 @@ def test_duplicate_speaker_map_names_succeed_with_warning(tmp_path: Path, monkey
     assert progress[-1]["event"] == "done"
 
 
-def test_unsupported_speaker_map_name_falls_back_to_unknown(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_nonliteral_speaker_name_is_preserved_with_warning(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     install_fake_mlx(monkeypatch, words=("hello", "world"), word_starts=(0.0, 1.0))
     install_fake_diarize(
         monkeypatch,
@@ -904,6 +912,7 @@ def test_unsupported_speaker_map_name_falls_back_to_unknown(tmp_path: Path, monk
         ],
     )
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(
         "voxis.speaker_map.call_json_schema_llm",
         lambda prompt, *, config, model, schema_name, schema, max_tokens=2048, extra_body=None: LLMResponse(
@@ -941,17 +950,17 @@ def test_unsupported_speaker_map_name_falls_back_to_unknown(tmp_path: Path, monk
     transcript = (out / "transcript.md").read_text(encoding="utf-8")
     run = json.loads((out / "run.json").read_text(encoding="utf-8"))
     assert speaker_map["status"] == "succeeded_with_issues"
-    assert speaker_map["mapping"] == {"SPEAKER_00": "Alice", "SPEAKER_01": "Unknown (SPEAKER_01)"}
+    assert speaker_map["mapping"] == {"SPEAKER_00": "Alice", "SPEAKER_01": "Peter Yang"}
     assert speaker_map["issues"] == [
         {
-            "code": "UNSUPPORTED_NAME",
+            "code": "NAME_NOT_LITERAL",
             "severity": "warning",
-            "detail": "speaker map value must appear in context or transcript probe evidence; falling back to unknown",
+            "detail": "name does not appear verbatim in context or transcript probe; preserving model output",
             "speaker": "SPEAKER_01",
             "value": "Peter Yang",
         }
     ]
-    assert "[00:00:01] Unknown (SPEAKER_01): world\n" in transcript
+    assert "[00:00:01] Peter Yang: world\n" in transcript
     assert run["providers"]["speaker_map"]["status"] == "succeeded_with_issues"
     assert ("speaker_map", "done") in [(event["stage"], event["event"]) for event in progress]
     assert progress[-1]["stage"] == "run"
@@ -964,6 +973,7 @@ def test_speaker_map_failure_falls_back_to_unmapped_turns(
     install_fake_mlx(monkeypatch)
     install_fake_diarize(monkeypatch, [DiarizeSpan(0.0, 1.0, "SPEAKER_00")])
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     extra_keys = ",".join(f'"bad_{index}":"noise"' for index in range(6))
     monkeypatch.setattr(
         "voxis.speaker_map.call_json_schema_llm",
@@ -1095,6 +1105,7 @@ def test_non_probe_unknown_sortformer_cluster_is_repaired(tmp_path: Path, monkey
     install_fake_mlx(monkeypatch, words=words, word_starts=starts)
     install_fake_diarize(monkeypatch, spans)
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
 
     def fake_speaker_map_llm(
         prompt: str,
@@ -1152,6 +1163,7 @@ def test_polish_replaces_diarized_transcript_body(tmp_path: Path, monkeypatch: M
     install_fake_mlx(monkeypatch)
     install_fake_diarize(monkeypatch, [DiarizeSpan(0.0, 1.0, "SPEAKER_00")])
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(
         "voxis.speaker_map.call_json_schema_llm",
         lambda prompt, *, config, model, schema_name, schema, max_tokens=2048, extra_body=None: LLMResponse(
@@ -1216,6 +1228,7 @@ def test_polish_invalid_output_falls_back_to_unpolished_turns(tmp_path: Path, mo
     install_fake_mlx(monkeypatch, word_starts=(12.0,))
     install_fake_diarize(monkeypatch, [DiarizeSpan(12.0, 13.0, "SPEAKER_00")])
     monkeypatch.setenv("BAILIAN_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(
         "voxis.speaker_map.call_json_schema_llm",
         lambda prompt, *, config, model, schema_name, schema, max_tokens=2048, extra_body=None: LLMResponse(

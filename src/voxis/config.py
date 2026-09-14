@@ -12,7 +12,8 @@ CONFIG_PATH = Path.home() / ".config" / "voxis" / ".env"
 DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_POLISH_MODEL = "deepseek-v4-flash"
 DEFAULT_ASR_TERMS_MODEL = "qwen-flash"
-DEFAULT_SPEAKER_MAP_MODEL = "deepseek-v4-flash"
+DEFAULT_SPEAKER_MAP_MODEL = "deepseek-flash"
+DEFAULT_SPEAKER_MAP_BASE_URL = "https://api.deepseek.com"
 DEFAULT_POLISH_MAX_WORKERS = 20
 
 
@@ -26,6 +27,9 @@ class VoxisConfig:
     polish_max_workers: int = DEFAULT_POLISH_MAX_WORKERS
     asr_terms: tuple[str, ...] = ()
     llm_disable_thinking: bool = True
+    speaker_map_base_url: str | None = None
+    speaker_map_api_key: str | None = None
+    speaker_map_reasoning_effort: str | None = None
 
 
 def _nonempty(value: str | None) -> str | None:
@@ -82,6 +86,9 @@ def load_config(
         llm_api_key=llm_api_key,
         polish_model=get("VOXIS_POLISH_MODEL") or DEFAULT_POLISH_MODEL,
         speaker_map_model=get("VOXIS_SPEAKER_MAP_MODEL") or DEFAULT_SPEAKER_MAP_MODEL,
+        speaker_map_base_url=get("VOXIS_SPEAKER_MAP_BASE_URL") or DEFAULT_SPEAKER_MAP_BASE_URL,
+        speaker_map_api_key=get_alias("VOXIS_SPEAKER_MAP_API_KEY", "DEEPSEEK_API_KEY"),
+        speaker_map_reasoning_effort="low",
         asr_terms_model=get("VOXIS_ASR_TERMS_MODEL") or DEFAULT_ASR_TERMS_MODEL,
         polish_max_workers=DEFAULT_POLISH_MAX_WORKERS,
         asr_terms=_parse_term_list(get("VOXIS_ASR_TERMS")),

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from voxis.audio import sha256_text
 from voxis.config import VoxisConfig
 from voxis.diarization_types import Turn
 from voxis.llm import call_json_schema_llm, no_thinking_extra_body
+from voxis.speaker_context import clean_speaker_context
 
 SPEAKER_MAP_SCHEMA_VERSION = "speaker_map_v1"
 SPEAKER_MAP_PROMPT_TEMPLATE_ID = "speaker_map_first10_first_appearance_window_v3"
@@ -85,11 +86,20 @@ def build_speaker_map(
     context: str | None,
     config: VoxisConfig,
 ) -> SpeakerMapResult:
+    dedicated_provider = config.speaker_map_base_url is not None
+    if dedicated_provider:
+        # Never reuse the shared provider key for a different endpoint.
+        config = replace(
+            config,
+            llm_base_url=config.speaker_map_base_url or config.llm_base_url,
+            llm_api_key=config.speaker_map_api_key,
+            llm_disable_thinking=False,
+        )
     probe = _speaker_map_probe(turns)
     probe_turns = [entry.turn for entry in probe]
     probe_speakers = _speaker_labels_from_turns(probe_turns)
     all_turn_speakers = _speaker_labels_from_turns(turns)
-    stripped_context = (context or "").strip()
+    stripped_context = clean_speaker_context(context or "")
     if not all_turn_speakers:
         return _skipped("skipped_no_speakers", probe_speakers=probe_speakers, all_turn_speakers=all_turn_speakers)
     evidence_mode = "context_and_probe" if stripped_context else "probe_only"
@@ -103,7 +113,12 @@ def build_speaker_map(
 
     prompt = SPEAKER_MAP_PROMPT.format(context=stripped_context, probe=_turns_to_text(probe_turns))
     schema = _speaker_map_response_schema(probe_speakers)
-    max_tokens = _speaker_map_max_tokens(probe_speakers)
+    max_tokens = None if dedicated_provider else _speaker_map_max_tokens(probe_speakers)
+    extra_body = (
+        {"thinking": {"type": "enabled"}, "reasoning_effort": config.speaker_map_reasoning_effort or "low"}
+        if dedicated_provider
+        else no_thinking_extra_body(config)
+    )
     prompt_tokens = 0
     completion_tokens = 0
     elapsed_seconds = 0.0
@@ -118,7 +133,7 @@ def build_speaker_map(
                 schema_name="speaker_map_response",
                 schema=schema,
                 max_tokens=max_tokens,
-                extra_body=no_thinking_extra_body(config),
+                extra_body=extra_body,
             )
         except Exception as exc:
             return SpeakerMapResult(
@@ -261,6 +276,8 @@ def _skipped(
 
 
 def _thinking_enabled_receipt(config: VoxisConfig) -> bool | None:
+    if config.speaker_map_base_url is not None:
+        return True
     return False if config.llm_disable_thinking else None
 
 
@@ -476,15 +493,13 @@ def _canonicalize_speaker_map(
         if normalized != unknown and normalized not in evidence_text:
             issues.append(
                 _issue(
-                    "UNSUPPORTED_NAME",
-                    "speaker map value must appear in context or transcript probe evidence; falling back to unknown",
+                    "NAME_NOT_LITERAL",
+                    "name does not appear verbatim in context or transcript probe; preserving model output",
                     speaker,
                     value,
                     severity="warning",
                 )
             )
-            mapping[speaker] = unknown
-            continue
         mapping[speaker] = normalized
 
     lower_to_speakers: dict[str, list[str]] = {}

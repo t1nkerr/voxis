@@ -100,7 +100,7 @@ def test_build_speaker_map_skips_without_llm_key() -> None:
     assert result.evidence_mode == "probe_only"
 
 
-def test_probe_only_speaker_map_falls_back_for_names_not_in_probe(monkeypatch: MonkeyPatch) -> None:
+def test_probe_only_speaker_map_preserves_names_not_in_probe(monkeypatch: MonkeyPatch) -> None:
     def fake_call_json_schema_llm(
         prompt: str,
         *,
@@ -124,8 +124,8 @@ def test_probe_only_speaker_map_falls_back_for_names_not_in_probe(monkeypatch: M
 
     assert result.status == "succeeded_with_issues"
     assert result.evidence_mode == "probe_only"
-    assert result.mapping == {"SPEAKER_00": "Unknown (SPEAKER_00)"}
-    assert [issue["code"] for issue in result.issues] == ["UNSUPPORTED_NAME"]
+    assert result.mapping == {"SPEAKER_00": "Alice"}
+    assert [issue["code"] for issue in result.issues] == ["NAME_NOT_LITERAL"]
     assert {issue["severity"] for issue in result.issues} == {"warning"}
 
 
@@ -350,8 +350,8 @@ def test_semantic_speaker_map_errors_do_not_retry(monkeypatch: MonkeyPatch) -> N
 
     assert calls == 1
     assert result.status == "succeeded_with_issues"
-    assert result.mapping == {"SPEAKER_00": "Unknown (SPEAKER_00)"}
-    assert [issue["code"] for issue in result.issues] == ["UNSUPPORTED_NAME"]
+    assert result.mapping == {"SPEAKER_00": "Alice"}
+    assert [issue["code"] for issue in result.issues] == ["NAME_NOT_LITERAL"]
     assert {issue["severity"] for issue in result.issues} == {"warning"}
 
 
@@ -398,7 +398,7 @@ def test_duplicate_real_name_mappings_succeed_with_warning(monkeypatch: MonkeyPa
     ]
 
 
-def test_duplicate_unsupported_real_names_fall_back_to_unknown(monkeypatch: MonkeyPatch) -> None:
+def test_duplicate_nonliteral_names_are_preserved(monkeypatch: MonkeyPatch) -> None:
     def fake_call_json_schema_llm(
         prompt: str,
         *,
@@ -426,10 +426,15 @@ def test_duplicate_unsupported_real_names_fall_back_to_unknown(monkeypatch: Monk
 
     assert result.status == "succeeded_with_issues"
     assert result.mapping == {
-        "SPEAKER_01": "Unknown (SPEAKER_01)",
-        "SPEAKER_02": "Unknown (SPEAKER_02)",
+        "SPEAKER_01": "Diane",
+        "SPEAKER_02": "Diane",
     }
-    assert [issue["code"] for issue in result.issues] == ["UNSUPPORTED_NAME", "UNSUPPORTED_NAME"]
+    assert [issue["code"] for issue in result.issues] == [
+        "NAME_NOT_LITERAL",
+        "NAME_NOT_LITERAL",
+        "DUPLICATE_REAL_NAME",
+        "DUPLICATE_REAL_NAME",
+    ]
     assert {issue["severity"] for issue in result.issues} == {"warning"}
 
 
@@ -523,7 +528,7 @@ def test_generic_unknown_placeholder_value_is_rejected(monkeypatch: MonkeyPatch)
     assert [issue["code"] for issue in result.issues] == ["INVALID_UNKNOWN_VALUE"]
 
 
-def test_unsupported_speaker_name_falls_back_to_unknown(monkeypatch: MonkeyPatch) -> None:
+def test_nonliteral_speaker_name_is_preserved(monkeypatch: MonkeyPatch) -> None:
     def fake_call_json_schema_llm(
         prompt: str,
         *,
@@ -546,8 +551,8 @@ def test_unsupported_speaker_name_falls_back_to_unknown(monkeypatch: MonkeyPatch
     result = build_speaker_map([Turn("SPEAKER_00", 0.0, 1.0, "hello")], context="Host: Alice.", config=make_config())
 
     assert result.status == "succeeded_with_issues"
-    assert result.mapping == {"SPEAKER_00": "Unknown (SPEAKER_00)"}
-    assert [issue["code"] for issue in result.issues] == ["UNSUPPORTED_NAME"]
+    assert result.mapping == {"SPEAKER_00": "未知"}
+    assert [issue["code"] for issue in result.issues] == ["NAME_NOT_LITERAL"]
     assert {issue["severity"] for issue in result.issues} == {"warning"}
 
 
@@ -586,3 +591,53 @@ def make_config(api_key: str | None = "key", *, llm_disable_thinking: bool = Tru
         speaker_map_model="speaker-map-model",
         llm_disable_thinking=llm_disable_thinking,
     )
+
+
+def test_mapper_uses_cleaned_context_for_prompt_and_validation(monkeypatch: MonkeyPatch) -> None:
+    def fake_call(prompt: str, **kwargs: object) -> LLMResponse:
+        assert "example.com" not in prompt
+        assert "HiddenName" not in prompt
+        assert "Visible Name" in prompt
+        return LLMResponse(
+            '{"mapping":{"SPEAKER_00":"HiddenName"}}',
+            elapsed_seconds=0.1,
+            prompt_tokens=10,
+            completion_tokens=5,
+        )
+
+    monkeypatch.setattr("voxis.speaker_map.call_json_schema_llm", fake_call)
+    result = build_speaker_map(
+        [Turn("SPEAKER_00", 0, 1, "Hello")],
+        context="[Visible Name](https://example.com/HiddenName)",
+        config=make_config(),
+    )
+    assert result.mapping == {"SPEAKER_00": "HiddenName"}
+    assert any(issue["code"] == "NAME_NOT_LITERAL" for issue in result.issues)
+
+
+def test_dedicated_deepseek_request_has_no_cap_and_preserves_polish(monkeypatch: MonkeyPatch) -> None:
+    from voxis.config import load_config
+    from pathlib import Path
+
+    config = load_config(
+        env_file=Path("/missing"), environ={"BAILIAN_API_KEY": "shared", "DEEPSEEK_API_KEY": "speaker"}
+    )
+
+    def fake_call(prompt: str, **kwargs: object) -> LLMResponse:
+        stage_config = kwargs["config"]
+        assert isinstance(stage_config, VoxisConfig)
+        assert stage_config.llm_api_key == "speaker"
+        assert stage_config.llm_base_url == "https://api.deepseek.com"
+        assert kwargs["max_tokens"] is None
+        assert kwargs["extra_body"] == {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}
+        assert "https://" not in prompt
+        return LLMResponse('{"mapping":{"SPEAKER_00":"Peter Yang"}}', 0.1, 10, 5)
+
+    monkeypatch.setattr("voxis.speaker_map.call_json_schema_llm", fake_call)
+    result = build_speaker_map(
+        [Turn("SPEAKER_00", 0, 1, "I am PeterYang")], context="PeterYang https://example.com/PeterYang", config=config
+    )
+    assert result.mapping == {"SPEAKER_00": "Peter Yang"}
+    assert result.thinking_enabled is True
+    assert config.llm_api_key == "shared"
+    assert config.polish_model == "deepseek-v4-flash"
