@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import types
 from pathlib import Path
@@ -73,6 +74,7 @@ def test_transcribe_writes_phase_one_outputs(
         ("load_audio", "started"),
         ("load_audio", "done"),
         ("asr", "started"),
+        ("asr", "chunk_done"),
         ("asr", "done"),
         ("alignment", "started"),
         ("alignment", "done"),
@@ -81,8 +83,10 @@ def test_transcribe_writes_phase_one_outputs(
         ("run", "done"),
     ]
     assert progress[2]["duration_seconds"] == 1.0
-    assert progress[4]["segment_count"] == 1
-    assert progress[6]["word_count"] == 1
+    assert progress[4]["chunk_count"] == 1
+    assert progress[4]["token_cap_hit"] is False
+    assert progress[5]["segment_count"] == 1
+    assert progress[7]["word_count"] == 1
     stderr = capsys.readouterr().err
     assert "voxis asr started" in stderr
     assert "voxis run done" in stderr
@@ -149,7 +153,8 @@ def test_transcribe_passes_context_terms_and_language_to_asr(tmp_path: Path, mon
     )
 
     assert calls["asr"]["language"] == "en"
-    assert calls["asr"]["chunk_duration"] == 60.0
+    assert calls["split_calls"][0]["chunk_duration"] == 60.0
+    assert calls["asr"]["max_tokens"] == asr.MIN_CHUNK_MAX_TOKENS
     assert calls["asr"]["system_prompt"] == "Claude Code\nClaude\nCodex\nOpenClaw\nKimi\nSeedance\nCAR-T"
     run = json.loads((out / "run.json").read_text(encoding="utf-8"))
     assert run["transcript"]["asr_terms"] == ["Claude Code", "Claude", "Codex", "OpenClaw", "Kimi", "Seedance", "CAR-T"]
@@ -360,7 +365,6 @@ def test_asr_truncation_gap_fails_loudly(
 
     stderr = capsys.readouterr().err
     assert "voxis: error: ASR transcript appears truncated" in stderr
-    assert "max_tokens budget" in stderr
     assert not (out / "transcript.md").exists()
 
 
@@ -440,8 +444,8 @@ def test_degenerate_asr_segment_retries_once_then_fails_before_alignment(
     assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--language", "zh", "--debug"]) == 1
 
     assert len(calls["asr_calls"]) == 2
-    assert calls["asr_calls"][1]["chunk_duration"] == 30.0
-    assert calls["asr_calls"][1]["max_tokens"] == 8_192
+    assert calls["split_calls"][1]["chunk_duration"] == 30.0
+    assert calls["asr_calls"][1]["max_tokens"] == math.ceil(64.718 * asr.MAX_TOKENS_PER_SECOND)
     assert "system_prompt" not in calls["asr_calls"][1]
     assert "aligner_calls" not in calls
     assert "ASR degenerate segment persisted after retry" in capsys.readouterr().err
@@ -495,6 +499,114 @@ def test_clean_segment_retry_replaces_only_suspect_span_with_absolute_timestamps
     assert calls["asr_waveform_lengths"] == [30 * asr.SAMPLE_RATE_HZ, 10 * asr.SAMPLE_RATE_HZ]
     run = json.loads((out / "run.json").read_text(encoding="utf-8"))
     assert run["providers"]["asr"]["degeneration_guard"]["retry_count"] == 1
+
+
+def test_first_pass_caps_tokens_per_chunk_offsets_segments_and_pins_detected_language(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    calls = install_fake_mlx(
+        monkeypatch,
+        asr_outputs=[
+            [{"start": 0.0, "end": 60.0, "text": "first chunk", "language": "English"}],
+            [{"start": 0.0, "end": 30.0, "text": "second chunk", "language": "English"}],
+        ],
+        split_chunk_seconds=60.0,
+    )
+    monkeypatch.setattr("voxis.run.load_audio_file", _fake_loaded_audio(tmp_path, duration_seconds=90.0))
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--debug"]) == 0
+
+    assert [call["max_tokens"] for call in calls["asr_calls"]] == [
+        math.ceil(60.0 * asr.MAX_TOKENS_PER_SECOND),
+        math.ceil(30.0 * asr.MAX_TOKENS_PER_SECOND),
+    ]
+    assert all(call["chunk_duration"] == math.inf for call in calls["asr_calls"])
+    assert [call["language"] for call in calls["asr_calls"]] == [None, "English"]
+    debug = json.loads((out / "_debug" / "asr_segments.json").read_text(encoding="utf-8"))
+    assert [(segment["start"], segment["end"]) for segment in debug["segments"]] == [(0.0, 60.0), (60.0, 90.0)]
+    progress = [
+        json.loads(line) for line in (out / "_debug" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    chunk_events = [event for event in progress if event["event"] == "chunk_done"]
+    assert [(event["chunk_index"], event["chunk_count"], event["chunk_start"]) for event in chunk_events] == [
+        (0, 2, 0.0),
+        (1, 2, 60.0),
+    ]
+
+
+def test_token_cap_hit_routes_low_density_chunk_to_retry(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    capped_tokens = math.ceil(60.0 * asr.MAX_TOKENS_PER_SECOND)
+    calls = install_fake_mlx(
+        monkeypatch,
+        asr_outputs=[
+            [{"start": 0.0, "end": 60.0, "text": "real speech then 用用用", "language": "en"}],
+            [{"start": 0.0, "end": 60.0, "text": "recovered speech", "language": "en"}],
+        ],
+        asr_generation_tokens=[capped_tokens, 4],
+    )
+    monkeypatch.setattr("voxis.run.load_audio_file", _fake_loaded_audio(tmp_path, duration_seconds=60.0))
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--language", "en", "--debug"]) == 0
+
+    assert len(calls["asr_calls"]) == 2
+    debug = json.loads((out / "_debug" / "asr_segments.json").read_text(encoding="utf-8"))
+    assert [segment["text"] for segment in debug["segments"]] == ["recovered speech"]
+    retry = debug["degeneration_retries"][0]
+    assert retry["initial_metrics"]["token_cap_hit"] is True
+    assert retry["initial_metrics"]["suspect"] is True
+    assert retry["retry_metrics"][0]["token_cap_hit"] is False
+
+
+def test_retry_with_fractional_chunk_boundaries_stays_contiguous(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    retry_chunk_seconds = [25.0506875, 25.0506875, 9.898625]
+    install_fake_mlx(
+        monkeypatch,
+        asr_outputs=[
+            [{"start": 0.0, "end": 60.0, "text": "looping", "language": "en"}],
+            *[[{"start": 0.0, "end": seconds, "text": "clean", "language": "en"}] for seconds in retry_chunk_seconds],
+        ],
+        asr_generation_tokens=[math.ceil(60.0 * asr.MAX_TOKENS_PER_SECOND), 4, 4, 4],
+        split_plans=[[60.0], retry_chunk_seconds],
+    )
+    monkeypatch.setattr("voxis.run.load_audio_file", _fake_loaded_audio(tmp_path, duration_seconds=60.0))
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--language", "en", "--debug"]) == 0
+
+    debug = json.loads((out / "_debug" / "asr_segments.json").read_text(encoding="utf-8"))
+    assert [(segment["start"], segment["end"]) for segment in debug["segments"]] == [
+        (0.0, 25.051),
+        (25.051, 50.101),
+        (50.101, 60.0),
+    ]
+    assert debug["degeneration_retries"][0]["coverage_metrics"]["complete"] is True
+
+
+def test_token_cap_hit_on_retry_fails_closed(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    install_fake_mlx(
+        monkeypatch,
+        asr_outputs=[[{"start": 0.0, "end": 60.0, "text": "still looping", "language": "en"}]],
+        asr_generation_tokens=[10_000, 10_000],
+    )
+    monkeypatch.setattr("voxis.run.load_audio_file", _fake_loaded_audio(tmp_path, duration_seconds=60.0))
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--language", "en", "--debug"]) == 1
+
+    assert "ASR degenerate segment persisted after retry" in capsys.readouterr().err
+    assert not (out / "transcript.md").exists()
 
 
 def test_segment_retry_rejects_truncated_first_chunk(
@@ -1300,6 +1412,9 @@ def install_fake_mlx(
     word_starts: tuple[float, ...] | None = None,
     asr_outputs: list[list[dict[str, Any]]] | None = None,
     fail_asr_on_call: int | None = None,
+    asr_generation_tokens: list[int] | None = None,
+    split_chunk_seconds: float | None = None,
+    split_plans: list[list[float]] | None = None,
 ) -> dict[str, Any]:
     asr._load_asr_model.cache_clear()
     asr._load_aligner_model.cache_clear()
@@ -1314,9 +1429,10 @@ def install_fake_mlx(
     asr_output_sets = asr_outputs or default_asr_outputs
 
     class FakeAsrOutput:
-        def __init__(self, segments: list[dict[str, Any]]) -> None:
+        def __init__(self, segments: list[dict[str, Any]], generation_tokens: int) -> None:
             self.segments = segments
             self.text = " ".join(str(segment["text"]) for segment in segments)
+            self.generation_tokens = generation_tokens
 
     class FakeAsrModel:
         def generate(self, waveform: object, **kwargs: object) -> FakeAsrOutput:
@@ -1325,8 +1441,24 @@ def install_fake_mlx(
             calls.setdefault("asr_waveform_lengths", []).append(len(cast(Any, waveform)))
             if fail_asr_on_call == len(calls["asr_calls"]):
                 raise RuntimeError("ASR provider retry failed")
-            output_index = min(len(calls["asr_calls"]) - 1, len(asr_output_sets) - 1)
-            return FakeAsrOutput(asr_output_sets[output_index])
+            call_index = len(calls["asr_calls"]) - 1
+            output_index = min(call_index, len(asr_output_sets) - 1)
+            generation_tokens = asr_generation_tokens[call_index] if asr_generation_tokens else 1
+            return FakeAsrOutput(asr_output_sets[output_index], generation_tokens)
+
+    def fake_split_audio_into_chunks(wav: Any, *, sr: int, chunk_duration: float) -> list[tuple[Any, float]]:
+        calls.setdefault("split_calls", []).append({"sr": sr, "chunk_duration": chunk_duration})
+        if split_plans is not None:
+            durations = split_plans[min(len(calls["split_calls"]) - 1, len(split_plans) - 1)]
+            plan_chunks: list[tuple[Any, float]] = []
+            start_sample = 0
+            for seconds in durations:
+                end_sample = start_sample + round(seconds * sr)
+                plan_chunks.append((wav[start_sample:end_sample], start_sample / sr))
+                start_sample = end_sample
+            return plan_chunks
+        step = len(wav) if split_chunk_seconds is None else round(split_chunk_seconds * sr)
+        return [(wav[start : start + step], start / sr) for start in range(0, max(len(wav), 1), max(step, 1))]
 
     class FakeAlignItem:
         def __init__(self, text: str, start_time: float, end_time: float) -> None:
@@ -1356,9 +1488,14 @@ def install_fake_mlx(
 
     utils.load_audio = fake_load_audio
     utils.load_model = fake_load_model
+    qwen3_asr = cast(Any, types.ModuleType("mlx_audio.stt.models.qwen3_asr.qwen3_asr"))
+    qwen3_asr.split_audio_into_chunks = fake_split_audio_into_chunks
     monkeypatch.setitem(sys.modules, "mlx_audio", types.ModuleType("mlx_audio"))
     monkeypatch.setitem(sys.modules, "mlx_audio.stt", types.ModuleType("mlx_audio.stt"))
     monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", utils)
+    for name in ("mlx_audio.stt.models", "mlx_audio.stt.models.qwen3_asr"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "mlx_audio.stt.models.qwen3_asr.qwen3_asr", qwen3_asr)
     return calls
 
 

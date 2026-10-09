@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,9 +29,11 @@ ASR_MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
 ALIGNER_MODEL_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 SAMPLE_RATE_HZ = 16_000
 CHUNK_DURATION_SECONDS = 60.0
-MAX_TOKENS_BUDGET = 524_288
+# Per-chunk generation cap. Observed speech peaks near 6 tokens/s (Chinese ~350 chars/min), so 32 tokens/s leaves
+# ~5x headroom while bounding the tokens a looping chunk can generate, instead of sharing one whole-file budget.
+MAX_TOKENS_PER_SECOND = 32.0
+MIN_CHUNK_MAX_TOKENS = 256
 DEGENERATION_RETRY_CHUNK_DURATION_SECONDS = 30.0
-DEGENERATION_RETRY_MAX_TOKENS_BUDGET = 8_192
 DEGENERATION_RETRY_MAX_COVERAGE_GAP_SECONDS = 0.1
 DEGENERATION_RETRY_MAX_TOTAL_UNCOVERED_SECONDS = 0.1
 DEGENERATION_MIN_DURATION_SECONDS = 10.0
@@ -73,14 +77,7 @@ def transcribe_audio(
     terms = prompt_terms(term_extraction.terms, config=config)
     waveform = audio.waveform
 
-    asr_kwargs: dict[str, Any] = {
-        "language": None if language == "auto" else language,
-        "chunk_duration": CHUNK_DURATION_SECONDS,
-        "max_tokens": MAX_TOKENS_BUDGET,
-    }
     system_prompt = system_prompt_from_terms(terms, config=config)
-    if system_prompt is not None:
-        asr_kwargs["system_prompt"] = system_prompt
 
     _emit_progress(
         progress,
@@ -88,16 +85,22 @@ def transcribe_audio(
         "started",
         language=language,
         chunk_duration_seconds=CHUNK_DURATION_SECONDS,
-        max_tokens_budget=MAX_TOKENS_BUDGET,
+        max_tokens_per_second=MAX_TOKENS_PER_SECOND,
         asr_prompt_term_count=len(terms),
     )
     try:
-        asr_output = _generate_asr(waveform, asr_kwargs)
+        asr_output = _generate_chunked_asr(
+            waveform,
+            language=language,
+            chunk_duration=CHUNK_DURATION_SECONDS,
+            system_prompt=system_prompt,
+            progress=progress,
+        )
     except Exception as exc:
         _emit_progress(progress, "asr", "failed", error_type=type(exc).__name__, error_message=str(exc))
         raise
 
-    segments = [provider_segment_payload(segment) for segment in asr_output.segments]
+    segments = asr_output.segments
     prompt_echo = detect_prompt_echo(segments, terms)
     prompt_echo_trimmed_segment_count = 0
     if system_prompt is not None and prompt_echo.status == "detected":
@@ -131,6 +134,7 @@ def transcribe_audio(
         )
     segments, degeneration_retries = _recover_degenerate_segments(
         segments,
+        capped_segment_indices=asr_output.capped_segment_indices,
         waveform=waveform,
         language=language,
         progress=progress,
@@ -149,8 +153,7 @@ def transcribe_audio(
         raise RuntimeError(
             "ASR transcript appears truncated: segments end "
             f"{float(segments[-1]['end']):.1f}s into {audio.duration_s:.1f}s of audio, leaving "
-            f"{truncation_gap:.1f}s uncovered. The max_tokens budget ({MAX_TOKENS_BUDGET}) is the likely cause: "
-            "mlx-audio treats it as a whole-file budget and stops early when it is exhausted."
+            f"{truncation_gap:.1f}s uncovered."
         )
     primary_language = segments[0]["language"] if segments else "unknown"
     _emit_progress(
@@ -218,7 +221,7 @@ def transcribe_audio(
         )
     _emit_progress(progress, "alignment", "done", word_count=len(words), error_count=len(alignment_errors))
     return AsrResult(
-        text=_segments_text(segments) or str(asr_output.text),
+        text=_segments_text(segments),
         language=str(primary_language),
         audio_duration_s=audio.duration_s,
         terms=terms,
@@ -244,6 +247,7 @@ def transcribe_audio(
 def _recover_degenerate_segments(
     segments: list[dict[str, Any]],
     *,
+    capped_segment_indices: frozenset[int],
     waveform: Any,
     language: str,
     progress: ProgressCallback | None,
@@ -251,7 +255,7 @@ def _recover_degenerate_segments(
     recovered: list[dict[str, Any]] = []
     retries: list[dict[str, Any]] = []
     for index, segment in enumerate(segments):
-        initial_metrics = _segment_degeneration_metrics(segment)
+        initial_metrics = _segment_degeneration_metrics(segment, token_cap_hit=index in capped_segment_indices)
         if not initial_metrics["suspect"]:
             recovered.append(segment)
             continue
@@ -268,11 +272,6 @@ def _recover_degenerate_segments(
         end = float(segment["end"])
         start_sample = max(0, int(start * SAMPLE_RATE_HZ))
         end_sample = min(len(waveform), max(start_sample, int(end * SAMPLE_RATE_HZ)))
-        retry_kwargs: dict[str, Any] = {
-            "language": None if language == "auto" else language,
-            "chunk_duration": DEGENERATION_RETRY_CHUNK_DURATION_SECONDS,
-            "max_tokens": DEGENERATION_RETRY_MAX_TOKENS_BUDGET,
-        }
         _emit_progress(
             progress,
             "asr",
@@ -281,12 +280,18 @@ def _recover_degenerate_segments(
             segment_start=segment["start"],
             segment_end=segment["end"],
             chunk_duration_seconds=DEGENERATION_RETRY_CHUNK_DURATION_SECONDS,
-            max_tokens_budget=DEGENERATION_RETRY_MAX_TOKENS_BUDGET,
+            max_tokens_per_second=MAX_TOKENS_PER_SECOND,
             context_prompt=False,
             metrics=initial_metrics,
         )
         try:
-            retry_output = _generate_asr(waveform[start_sample:end_sample], retry_kwargs)
+            retry_output = _generate_chunked_asr(
+                waveform[start_sample:end_sample],
+                language=language,
+                chunk_duration=DEGENERATION_RETRY_CHUNK_DURATION_SECONDS,
+                system_prompt=None,
+                progress=None,
+            )
         except Exception as exc:
             _emit_progress(
                 progress,
@@ -301,12 +306,16 @@ def _recover_degenerate_segments(
             )
             raise RuntimeError(f"ASR degenerate segment retry failed at {start:.3f}-{end:.3f}s") from exc
 
-        replacement = _offset_retry_segments(
-            [provider_segment_payload(item) for item in retry_output.segments],
+        replacement, replacement_capped = _offset_retry_segments(
+            retry_output.segments,
+            capped_indices=retry_output.capped_segment_indices,
             offset_seconds=start,
             duration_seconds=end - start,
         )
-        retry_metrics = [_segment_degeneration_metrics(item) for item in replacement]
+        retry_metrics = [
+            _segment_degeneration_metrics(item, token_cap_hit=capped)
+            for item, capped in zip(replacement, replacement_capped, strict=True)
+        ]
         coverage_metrics = _retry_coverage_metrics(
             replacement,
             span_start=start,
@@ -348,14 +357,20 @@ def _recover_degenerate_segments(
 
 
 def _offset_retry_segments(
-    segments: list[dict[str, Any]], *, offset_seconds: float, duration_seconds: float
-) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]],
+    *,
+    capped_indices: frozenset[int],
+    offset_seconds: float,
+    duration_seconds: float,
+) -> tuple[list[dict[str, Any]], list[bool]]:
     replacement: list[dict[str, Any]] = []
-    for segment in segments:
+    capped: list[bool] = []
+    for index, segment in enumerate(segments):
         relative_start = max(0.0, float(segment["start"]))
         relative_end = min(duration_seconds, float(segment["end"]))
         if relative_end <= relative_start:
             continue
+        capped.append(index in capped_indices)
         replacement.append(
             {
                 **segment,
@@ -363,10 +378,10 @@ def _offset_retry_segments(
                 "end": json_time(offset_seconds + relative_end),
             }
         )
-    return replacement
+    return replacement, capped
 
 
-def _segment_degeneration_metrics(segment: dict[str, Any]) -> dict[str, Any]:
+def _segment_degeneration_metrics(segment: dict[str, Any], *, token_cap_hit: bool = False) -> dict[str, Any]:
     text = str(segment.get("text", "")).strip()
     duration_seconds = max(0.0, float(segment["end"]) - float(segment["start"]))
     content_chars = [char for char in text if not char.isspace()]
@@ -375,7 +390,7 @@ def _segment_degeneration_metrics(segment: dict[str, Any]) -> dict[str, Any]:
     dominant_ratio = dominant_count / len(content_chars) if content_chars else 0.0
     repeated_sequence = _repeated_sequence_metrics("".join(content_chars))
     chars_per_second = len(text) / duration_seconds if duration_seconds > 0 else float("inf")
-    suspect = (
+    suspect = token_cap_hit or (
         duration_seconds >= DEGENERATION_MIN_DURATION_SECONDS
         and len(text) >= DEGENERATION_MIN_TEXT_CHARS
         and chars_per_second >= DEGENERATION_MIN_CHARS_PER_SECOND
@@ -391,6 +406,7 @@ def _segment_degeneration_metrics(segment: dict[str, Any]) -> dict[str, Any]:
         "repeated_sequence_unit_chars": repeated_sequence["unit_chars"],
         "repeated_sequence": repeated_sequence["sequence"],
         "repeated_sequence_coverage": repeated_sequence["coverage"],
+        "token_cap_hit": token_cap_hit,
         "suspect": suspect,
     }
 
@@ -478,7 +494,8 @@ def profile_payload(
         "aligner_model_id": ALIGNER_MODEL_ID,
         "sample_rate_hz": SAMPLE_RATE_HZ,
         "chunk_duration_seconds": CHUNK_DURATION_SECONDS,
-        "max_tokens_budget": MAX_TOKENS_BUDGET,
+        "max_tokens_per_second": MAX_TOKENS_PER_SECOND,
+        "min_chunk_max_tokens": MIN_CHUNK_MAX_TOKENS,
         "language": language,
         "degeneration_guard": {
             "policy_id": DEGENERATION_POLICY_ID,
@@ -488,7 +505,6 @@ def profile_payload(
             "maximum_loop_unit_chars": DEGENERATION_MAX_LOOP_UNIT_CHARS,
             "minimum_repeated_sequence_coverage": DEGENERATION_MIN_REPEATED_SEQUENCE_COVERAGE,
             "retry_chunk_duration_seconds": DEGENERATION_RETRY_CHUNK_DURATION_SECONDS,
-            "retry_max_tokens_budget": DEGENERATION_RETRY_MAX_TOKENS_BUDGET,
             "retry_max_coverage_gap_seconds": DEGENERATION_RETRY_MAX_COVERAGE_GAP_SECONDS,
             "retry_max_total_uncovered_seconds": DEGENERATION_RETRY_MAX_TOTAL_UNCOVERED_SECONDS,
             "retry_count": degeneration_retry_count,
@@ -520,8 +536,80 @@ def _emit_progress(
         progress(stage, event, fields)
 
 
-def _generate_asr(waveform: Any, kwargs: dict[str, Any]) -> Any:
-    return _load_asr_model().generate(waveform, **kwargs)
+@dataclass(frozen=True)
+class _ChunkedAsrOutput:
+    segments: list[dict[str, Any]]
+    capped_segment_indices: frozenset[int]
+
+
+def _generate_chunked_asr(
+    waveform: Any,
+    *,
+    language: str,
+    chunk_duration: float,
+    system_prompt: str | None,
+    progress: ProgressCallback | None,
+) -> _ChunkedAsrOutput:
+    """Run ASR one chunk at a time so each chunk gets its own token cap.
+
+    mlx-audio's chunked generate shares max_tokens across the whole file, so a single looping chunk can generate
+    for hours before the degeneration guard sees any output. Driving the chunk loop here bounds each chunk and
+    flags cap hits for the existing retry.
+    """
+    from mlx_audio.stt.models.qwen3_asr.qwen3_asr import split_audio_into_chunks  # type: ignore[import-untyped]
+
+    model = _load_asr_model()
+    chunks = split_audio_into_chunks(waveform, sr=SAMPLE_RATE_HZ, chunk_duration=chunk_duration)
+    # mlx-audio pins the first chunk's detected language for later chunks; keep that behavior.
+    chunk_language: str | None = None if language == "auto" else language
+    segments: list[dict[str, Any]] = []
+    capped: set[int] = set()
+    for chunk_index, (chunk, offset_seconds) in enumerate(chunks):
+        chunk_seconds = len(chunk) / SAMPLE_RATE_HZ
+        max_tokens = max(MIN_CHUNK_MAX_TOKENS, math.ceil(chunk_seconds * MAX_TOKENS_PER_SECOND))
+        kwargs: dict[str, Any] = {
+            "language": chunk_language,
+            # The chunk is already split; an infinite duration keeps mlx-audio from splitting it again.
+            "chunk_duration": math.inf,
+            "max_tokens": max_tokens,
+        }
+        if system_prompt is not None:
+            kwargs["system_prompt"] = system_prompt
+        started = time.monotonic()
+        output = model.generate(chunk, **kwargs)
+        generation_tokens = int(getattr(output, "generation_tokens", 0))
+        token_cap_hit = generation_tokens >= max_tokens
+        # Offset before rounding: rounding chunk-relative times first can make adjacent chunks overlap by 1 ms.
+        chunk_segments = [
+            provider_segment_payload(
+                {
+                    **segment,
+                    "start": float(segment["start"]) + offset_seconds,
+                    "end": float(segment["end"]) + offset_seconds,
+                }
+            )
+            for segment in output.segments
+        ]
+        for segment in chunk_segments:
+            if token_cap_hit:
+                capped.add(len(segments))
+            segments.append(segment)
+        if chunk_language is None and chunk_segments:
+            chunk_language = chunk_segments[0]["language"]
+        _emit_progress(
+            progress,
+            "asr",
+            "chunk_done",
+            chunk_index=chunk_index,
+            chunk_count=len(chunks),
+            chunk_start=json_time(offset_seconds),
+            chunk_seconds=round(chunk_seconds, 3),
+            max_tokens=max_tokens,
+            generation_tokens=generation_tokens,
+            token_cap_hit=token_cap_hit,
+            chunk_elapsed_seconds=round(time.monotonic() - started, 3),
+        )
+    return _ChunkedAsrOutput(segments=segments, capped_segment_indices=frozenset(capped))
 
 
 def _segments_text(segments: list[dict[str, Any]]) -> str:
