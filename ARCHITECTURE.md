@@ -58,9 +58,9 @@ Machine setup:
 
 - ASR: local MLX Audio, `mlx-community/Qwen3-ASR-1.7B-8bit`.
   - Voxis prefixes ASR prompts with glossary terms from `VOXIS_ASR_TERMS` (empty by default), then appends
-    extracted terms when context and an LLM key are available. The combined capped bare word list is passed as
-    Qwen3-ASR context. If ASR output echoes prompt terms as a contiguous tail, Voxis trims that tail before
-    alignment. Prompt echo outside the tail fails the ASR stage.
+    extracted terms (code default model `qwen3.8-flash`) when context and an LLM key are available. The combined
+    capped bare word list is passed as Qwen3-ASR context. If ASR output echoes prompt terms as a contiguous tail,
+    Voxis trims that tail before alignment. Prompt echo outside the tail fails the ASR stage.
 - Alignment: local MLX Audio, `mlx-community/Qwen3-ForcedAligner-0.6B-8bit`.
 - Diarization: FluidAudio Sortformer high-context, invoked as `fluidaudio sortformer --config high`.
 - Sortformer word policy: largest-overlap assignment plus language-profiled boundary repair.

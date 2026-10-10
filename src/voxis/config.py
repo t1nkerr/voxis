@@ -11,7 +11,7 @@ from dotenv import dotenv_values
 CONFIG_PATH = Path.home() / ".config" / "voxis" / ".env"
 DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_POLISH_MODEL = "qwen3.8-flash"
-DEFAULT_ASR_TERMS_MODEL = "qwen-flash"
+DEFAULT_ASR_TERMS_MODEL = "qwen3.8-flash"
 DEFAULT_SPEAKER_MAP_MODEL = "deepseek-flash"
 DEFAULT_SPEAKER_MAP_BASE_URL = "https://api.deepseek.com"
 DEFAULT_POLISH_MAX_WORKERS = 20

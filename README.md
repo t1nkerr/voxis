@@ -100,7 +100,7 @@ voxis-bench run-sortformer --audio /path/to/short-audio.m4a --out /tmp/voxis-flu
 over file values.
 
 - `VOXIS_LLM_API_KEY` (or `BAILIAN_API_KEY`): key for ASR term extraction and
-  `--polish`. Polish defaults to `qwen3.8-flash`. Their shared endpoint defaults to Bailian/DashScope, with
+  `--polish`. Both default to `qwen3.8-flash`. Their shared endpoint defaults to Bailian/DashScope, with
   `VOXIS_LLM_BASE_URL`, `VOXIS_POLISH_MODEL`, and `VOXIS_ASR_TERMS_MODEL` overrides.
 - `VOXIS_SPEAKER_MAP_API_KEY` (or `DEEPSEEK_API_KEY`): separate key for speaker-name
   mapping. Mapping defaults to official `deepseek-flash` at `https://api.deepseek.com`,
