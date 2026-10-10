@@ -34,6 +34,13 @@ The installer does not install Homebrew, ffmpeg, or Xcode automatically. It stop
 exact missing prerequisite. It installs a normal global `voxis` command, creates
 `~/.config/voxis/.env` only when absent, and never overwrites existing config.
 
+To pin the global `voxis` to one exact commit, with dependencies constrained to that
+commit's `uv.lock` (for example for scheduled jobs that must not pick up local edits):
+
+```bash
+./scripts/release.sh <commit> [--fluidaudio PATH]
+```
+
 Check readiness at any time:
 
 ```bash
