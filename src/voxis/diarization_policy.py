@@ -7,7 +7,7 @@ from typing import Any
 from voxis.audio import json_time
 from voxis.diarization_types import DiarizeSpan, Turn
 
-WORD_ASSIGNMENT_METHOD = "largest_overlap_v1"
+WORD_ASSIGNMENT_METHOD = "largest_overlap_v2"
 SORTFORMER_POLICY_ID = "sortformer_language_boundary_policy_v1"
 
 EN_BACKCHANNELS = frozenset(
@@ -44,17 +44,19 @@ def assign_words_by_largest_overlap(words: list[dict[str, Any]], spans: list[Dia
         text = str(row.get("text", "")).strip()
         start = float(row["start"])
         end = float(row["end"])
-        if not text or end <= start:
+        if not text or end < start:
             continue
         overlaps = _speaker_overlaps(start, end, sorted_spans)
         if overlaps:
             speaker, coverage_seconds = max(overlaps.items(), key=lambda item: (item[1], item[0]))
             assignment_reason = "largest_overlap"
         else:
+            # Zero-length words are real ASR words whose aligner timestamps collapsed onto a neighbour's
+            # (common for short words and numbers); they go to the span containing that instant.
             nearest = _nearest_span(start, end, sorted_spans)
             speaker = nearest.speaker
             coverage_seconds = 0.0
-            assignment_reason = "nearest_span_no_overlap"
+            assignment_reason = "nearest_span_zero_length" if end == start else "nearest_span_no_overlap"
         assigned.append(
             AssignedWord(
                 text=text,

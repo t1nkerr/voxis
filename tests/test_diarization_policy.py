@@ -26,6 +26,33 @@ def test_assign_words_by_largest_overlap_uses_full_word_interval() -> None:
     }
 
 
+def test_assign_words_by_largest_overlap_keeps_zero_length_words() -> None:
+    # Aligner output from a real run: "40" collapsed to a zero-length timestamp.
+    words = [
+        {"text": "lost", "start": 4002.0, "end": 4002.48},
+        {"text": "about", "start": 4002.48, "end": 4002.72},
+        {"text": "40", "start": 4002.72, "end": 4002.72},
+        {"text": "of", "start": 4003.12, "end": 4003.28},
+    ]
+    spans = [
+        DiarizeSpan(start=3990.0, end=4002.6, speaker="SPEAKER_00"),
+        DiarizeSpan(start=4002.6, end=4010.0, speaker="SPEAKER_01"),
+    ]
+
+    assigned = assign_words_by_largest_overlap(words, spans)
+
+    assert [word.text for word in assigned] == ["lost", "about", "40", "of"]
+    assert assigned[2].speaker == "SPEAKER_01"
+    assert assigned[2].assignment_reason == "nearest_span_zero_length"
+    assert assigned[2].coverage_ratio == 0.0
+
+
+def test_assign_words_by_largest_overlap_skips_inverted_words() -> None:
+    words = [{"text": "bad", "start": 2.0, "end": 1.0}]
+
+    assert assign_words_by_largest_overlap(words, [DiarizeSpan(start=0.0, end=3.0, speaker="SPEAKER_00")]) == []
+
+
 def test_sortformer_policy_repairs_short_unknown_between_same_named_speaker() -> None:
     words = [
         _word("This", 0.0, 0.3, "SPEAKER_00", {"SPEAKER_00": 0.3}),
