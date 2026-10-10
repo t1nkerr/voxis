@@ -790,6 +790,77 @@ def test_segment_degeneration_gate_keeps_corpus_derived_high_density_text(text: 
     assert metrics["suspect"] is False
 
 
+@pytest.mark.parametrize(
+    ("text", "tokens", "expected"),
+    [
+        (
+            'He said, "lost about 40% of the value." Then 60-70% — gone.',
+            ["He", "said", "lost", "about", "40", "of", "the", "value", "Then", "6070", "gone"],
+            [
+                ("He", None),
+                ("said,", True),
+                ('"lost', True),
+                ("about", True),
+                ("40%", True),
+                ("of", True),
+                ("the", True),
+                ('value."', True),
+                ("Then", True),
+                ("60-70% —", True),
+                ("gone.", True),
+            ],
+        ),
+        (
+            "我们用Claude，大概40%。",
+            ["我", "们", "用", "Claude", "大", "概", "40"],
+            [
+                ("我", None),
+                ("们", False),
+                ("用", False),
+                ("Claude，", False),
+                ("大", False),
+                ("概", False),
+                ("40%。", False),
+            ],
+        ),
+    ],
+)
+def test_surface_words_restore_asr_punctuation(
+    text: str, tokens: list[str], expected: list[tuple[str, bool | None]]
+) -> None:
+    assert asr._surface_words(text, tokens) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "tokens"),
+    [
+        ("Hello Claude Code", ["Hello"]),
+        ("Hello world", ["Hello", "word"]),
+    ],
+)
+def test_surface_words_reject_tokens_that_do_not_cover_the_text(text: str, tokens: list[str]) -> None:
+    assert asr._surface_words(text, tokens) is None
+
+
+def test_diarized_transcript_keeps_asr_punctuation(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    install_fake_mlx(
+        monkeypatch,
+        words=("It", "lost", "about", "40", "of", "it", "Then", "6070"),
+        asr_outputs=[[{"start": 0.0, "end": 4.0, "text": "It lost about 40% of it. Then 60-70%.", "language": "en"}]],
+    )
+    install_fake_diarize(monkeypatch, [DiarizeSpan(0.0, 4.0, "SPEAKER_00")])
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"fake audio")
+    out = tmp_path / "out"
+
+    assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--diarize"]) == 0
+
+    transcript = (out / "transcript.md").read_text(encoding="utf-8")
+    run = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert transcript == "# Transcript\n\n[00:00:00] SPEAKER_00: It lost about 40% of it. Then 60-70%.\n"
+    assert run["providers"]["asr"]["profile_id"] == "qwen3_asr_forced_aligner_v2"
+
+
 def test_transcribe_offsets_aligned_words_by_segment_start(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     install_fake_mlx(
         monkeypatch,
@@ -804,7 +875,7 @@ def test_transcribe_offsets_aligned_words_by_segment_start(tmp_path: Path, monke
     assert main(["transcribe", "--audio", str(audio), "--out", str(out), "--debug"]) == 0
 
     debug = json.loads((out / "_debug" / "asr_segments.json").read_text(encoding="utf-8"))
-    assert debug["words"] == [{"text": "Hello", "start": 10.25, "end": 10.5}]
+    assert debug["words"] == [{"text": "Hello", "start": 10.25, "end": 10.5, "space_before": False}]
 
 
 def test_diarize_writes_speaker_turns(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

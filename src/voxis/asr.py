@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,7 +45,7 @@ DEGENERATION_MIN_REPEATED_SEQUENCE_COVERAGE = 0.8
 DEGENERATION_POLICY_ID = "asr_segment_degeneration_guard_v1"
 TRUNCATION_MIN_GAP_SECONDS = 120.0
 TRUNCATION_GAP_RATIO = 0.2
-PROFILE_ID = "qwen3_asr_forced_aligner_v1"
+PROFILE_ID = "qwen3_asr_forced_aligner_v2"
 ProgressCallback = Callable[[str, str, dict[str, Any]], None]
 
 
@@ -193,12 +194,18 @@ def transcribe_audio(
                     }
                 )
                 continue
-            for item in _alignment_items(aligned):
+            items = _alignment_items(aligned)
+            surfaces = _surface_words(str(segment["text"]), [str(item.text) for item in items])
+            for index, item in enumerate(items):
+                text, space_before = surfaces[index] if surfaces is not None else (str(item.text), None)
+                if space_before is None:
+                    space_before = bool(words) and _ascii_word_boundary(words[-1]["text"], text)
                 words.append(
                     {
-                        "text": str(item.text),
+                        "text": text,
                         "start": json_time(float(item.start_time) + start),
                         "end": json_time(float(item.end_time) + start),
+                        "space_before": space_before,
                     }
                 )
     except Exception as exc:
@@ -476,6 +483,62 @@ def _alignment_items(aligned: Any) -> list[Any]:
     for output in outputs:
         items.extend(list(output.items))
     return items
+
+
+def _surface_words(text: str, tokens: list[str]) -> list[tuple[str, bool | None]] | None:
+    """Map aligner tokens back onto the ASR text so each word keeps its punctuation and symbols.
+
+    The aligner tokenizes on whitespace (and per CJK character) and keeps only letters, digits and apostrophes,
+    so "40%," aligns as "40". Returns (surface text, whitespace before it in the ASR text) per token, with None
+    for the first token's spacing, or None if the tokens are not the ASR text's kept characters in order.
+    """
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    for token in tokens:
+        start = None
+        for char in token:
+            while pos < len(text) and not _is_aligner_kept_char(text[pos]):
+                pos += 1
+            if pos >= len(text) or text[pos] != char:
+                return None
+            if start is None:
+                start = pos
+            pos += 1
+        if start is None:
+            return None
+        spans.append((start, pos))
+    if any(_is_aligner_kept_char(char) for char in text[pos:]):
+        return None
+    if not spans:
+        return []
+
+    surfaces: list[tuple[str, bool | None]] = []
+    opening = text[: spans[0][0]].strip()
+    space_before: bool | None = None
+    for index, (start, end) in enumerate(spans):
+        if index + 1 == len(spans):
+            surfaces.append((opening + text[start:].strip(), space_before))
+            break
+        gap = text[end : spans[index + 1][0]]
+        last_space = max((i for i, char in enumerate(gap) if char.isspace()), default=-1)
+        # Punctuation before the last whitespace in a gap closes this word; after it, it opens the next word.
+        # Without whitespace (CJK text, "60-70%") the whole gap stays with this word.
+        if last_space < 0:
+            closing, next_opening = gap, ""
+        else:
+            closing, next_opening = gap[:last_space].rstrip(), gap[last_space + 1 :]
+        surfaces.append((opening + text[start:end] + closing, space_before))
+        opening, space_before = next_opening, last_space >= 0
+    return surfaces
+
+
+def _is_aligner_kept_char(char: str) -> bool:
+    # Same rule as the aligner's clean_token: letters, digits and apostrophes.
+    return char == "'" or unicodedata.category(char)[0] in {"L", "N"}
+
+
+def _ascii_word_boundary(left: str, right: str) -> bool:
+    return bool(left and right and left[-1].isascii() and not left[-1].isspace() and right[0].isascii())
 
 
 def profile_payload(

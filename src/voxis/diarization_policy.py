@@ -27,6 +27,8 @@ class AssignedWord:
     coverage_ratio: float
     assignment_reason: str
     overlaps: dict[str, float]
+    # Whether the ASR text had whitespace before this word; None for words without that information.
+    space_before: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,7 @@ def assign_words_by_largest_overlap(words: list[dict[str, Any]], spans: list[Dia
                 coverage_ratio=coverage_seconds / max(0.001, end - start),
                 assignment_reason=assignment_reason,
                 overlaps=overlaps,
+                space_before=row.get("space_before"),
             )
         )
     return assigned
@@ -82,7 +85,7 @@ def turns_from_assigned_words(words: list[AssignedWord]) -> list[Turn]:
                 turns.append(current)
             current = Turn(speaker=word.speaker, start=word.start, end=word.end, text=word.text)
         else:
-            separator = " " if _needs_space(current.text, word.text) else ""
+            separator = _word_separator(current.text, word)
             current = Turn(
                 speaker=current.speaker,
                 start=current.start,
@@ -140,6 +143,7 @@ def assigned_words_payload(words: list[AssignedWord]) -> list[dict[str, Any]]:
             "coverage_ratio": round(word.coverage_ratio, 4),
             "assignment_reason": word.assignment_reason,
             "overlaps": {speaker: json_time(value) for speaker, value in sorted(word.overlaps.items())},
+            "space_before": word.space_before,
         }
         for word in words
     ]
@@ -189,7 +193,7 @@ def _repair_unknown_boundary_steals(
                     "end_index": end,
                     "from_speaker": speaker,
                     "to_speaker": destination,
-                    "text": _join_words(words[index].text for index in range(start, end)),
+                    "text": _join_words(words[index] for index in range(start, end)),
                     "start": json_time(words[start].start),
                     "end": json_time(words[end - 1].end),
                     "reason": "unknown_between_same_named_context",
@@ -387,7 +391,7 @@ def _is_stable_run(words: list[AssignedWord], run: tuple[int, int, str], languag
 
 def _is_backchannel(text: str, language_policy: dict[str, Any]) -> bool:
     normalized_ascii = re.sub(r"[^a-z]+", "", text.lower())
-    compact = re.sub(r"\s+", "", text.strip())
+    compact = re.sub(r"[^\w']+", "", text)
     backchannels = set(language_policy["backchannels"])
     return normalized_ascii in backchannels or compact in backchannels
 
@@ -401,9 +405,14 @@ def _with_speaker(word: AssignedWord, speaker: str, reason: str) -> AssignedWord
 def _join_words(words: Any) -> str:
     text = ""
     for word in words:
-        separator = " " if _needs_space(text, str(word)) else ""
-        text += separator + str(word)
+        text += (_word_separator(text, word) if text else "") + word.text
     return text
+
+
+def _word_separator(previous_text: str, word: AssignedWord) -> str:
+    if word.space_before is not None:
+        return " " if word.space_before else ""
+    return " " if _needs_space(previous_text, word.text) else ""
 
 
 def _needs_space(left: str, right: str) -> bool:

@@ -62,6 +62,8 @@ Machine setup:
     capped bare word list is passed as Qwen3-ASR context. If ASR output echoes prompt terms as a contiguous tail,
     Voxis trims that tail before alignment. Prompt echo outside the tail fails the ASR stage.
 - Alignment: local MLX Audio, `mlx-community/Qwen3-ForcedAligner-0.6B-8bit`.
+  The aligner keeps only letters, digits and apostrophes; Voxis maps each aligned word back onto the ASR text so
+  diarized turns keep the ASR punctuation, symbols and spacing within each ASR segment.
 - Diarization: FluidAudio Sortformer high-context, invoked as `fluidaudio sortformer --config high`.
 - Sortformer word policy: largest-overlap assignment plus language-profiled boundary repair.
   FluidAudio receives no language setting. With `--language auto`, Voxis reads ASR segment language metadata

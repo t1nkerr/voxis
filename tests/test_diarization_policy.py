@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from voxis.diarization_policy import (
     AssignedWord,
     apply_sortformer_policy,
@@ -182,6 +184,34 @@ def test_chinese_boundary_policy_rejects_context_only_zero_overlap_move() -> Non
     assert result.audit["boundary_word_guard_move_count"] == 0
     assert result.audit["language_policy"] == "zh_boundary_repair_profile_v1"
     assert result.audit["parameters"]["boundary_guard_mode"] == "strict_overlap_margin"
+
+
+def test_turns_from_assigned_words_uses_asr_spacing() -> None:
+    words = [
+        replace(_word("value.", 0.0, 0.2, "SPEAKER_00", {"SPEAKER_00": 0.2}), space_before=None),
+        replace(_word("And", 0.2, 0.4, "SPEAKER_00", {"SPEAKER_00": 0.2}), space_before=True),
+        replace(_word("60-", 0.4, 0.6, "SPEAKER_00", {"SPEAKER_00": 0.2}), space_before=True),
+        replace(_word("70%", 0.6, 0.8, "SPEAKER_00", {"SPEAKER_00": 0.2}), space_before=False),
+    ]
+
+    assert turns_from_assigned_words(words)[0].text == "value. And 60-70%"
+
+
+def test_sortformer_policy_preserves_punctuated_chinese_backchannel() -> None:
+    words = [
+        _word("我", 0.0, 0.3, "SPEAKER_00", {"SPEAKER_00": 0.3}),
+        _word("嗯，", 0.3, 0.55, "SPEAKER_02", {"SPEAKER_02": 0.25}),
+        _word("们", 0.55, 0.9, "SPEAKER_00", {"SPEAKER_00": 0.35}),
+    ]
+
+    result = apply_sortformer_policy(
+        words,
+        speaker_mapping={"SPEAKER_00": "Koji", "SPEAKER_02": "Unknown (SPEAKER_02)"},
+        language="zh",
+    )
+
+    assert [word.speaker for word in result.words] == ["SPEAKER_00", "SPEAKER_02", "SPEAKER_00"]
+    assert result.audit["unknown_boundary_repair_count"] == 0
 
 
 def test_turns_from_assigned_words_joins_chinese_without_spaces() -> None:
