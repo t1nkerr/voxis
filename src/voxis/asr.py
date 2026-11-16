@@ -113,6 +113,9 @@ def transcribe_audio(
                 "failed",
                 reason="prompt_echo_outside_tail",
                 suspect_segment_count=len(prompt_echo.suspect_segments),
+                suspect_segment_indexes=[segment.index for segment in prompt_echo.suspect_segments],
+                term_only_segment_indexes=list(prompt_echo.term_only_segment_indexes),
+                segment_count=prompt_echo.segment_count,
             )
             raise RuntimeError("ASR prompt echo detected outside contiguous tail")
         if tail_start == 0:

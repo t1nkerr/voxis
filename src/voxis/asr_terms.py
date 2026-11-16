@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -14,7 +15,7 @@ MAX_TERMS = 30
 MAX_TERM_CHARS = 80
 TERM_EXTRACTION_PROMPT_TEMPLATE_ID = "asr_term_extraction_json_v1"
 ASR_PROMPT_POLICY_ID = "asr_terms_bare_wordlist_v2"
-PROMPT_ECHO_POLICY_ID = "asr_prompt_echo_detector_v1"
+PROMPT_ECHO_POLICY_ID = "asr_prompt_echo_detector_v2"
 MIN_ECHO_TERMS = 4
 MIN_ECHO_ORDERED_TERMS = 4
 MIN_ECHO_OVERLAP_RATIO = 0.45
@@ -89,6 +90,7 @@ class PromptEchoResult:
     policy_id: str = PROMPT_ECHO_POLICY_ID
     segment_count: int = 0
     suspect_segments: tuple[PromptEchoSegment, ...] = ()
+    term_only_segment_indexes: tuple[int, ...] = ()
 
 
 def extract_terms(context: str | None, *, config: VoxisConfig) -> TermExtractionResult:
@@ -197,25 +199,30 @@ def detect_prompt_echo(segments: Sequence[dict[str, Any]], terms: Iterable[str] 
     if not normalized_terms:
         return PromptEchoResult(status="skipped_no_terms", segment_count=len(segments))
     suspect_segments: list[PromptEchoSegment] = []
+    term_only_segment_indexes: list[int] = []
     for index, segment in enumerate(segments):
         text = str(segment.get("text", ""))
         analysis = _prompt_echo_analysis(text, normalized_terms)
-        if _is_prompt_echo(analysis):
-            suspect_segments.append(
-                PromptEchoSegment(
-                    index=index,
-                    start=_float_or_none(segment.get("start")),
-                    end=_float_or_none(segment.get("end")),
-                    term_count=analysis["term_count"],
-                    ordered_term_count=analysis["ordered_term_count"],
-                    term_overlap_ratio=analysis["term_overlap_ratio"],
-                    text_excerpt=text[:240],
-                )
+        if not _is_prompt_echo(analysis):
+            if _is_term_only(text, normalized_terms):
+                term_only_segment_indexes.append(index)
+            continue
+        suspect_segments.append(
+            PromptEchoSegment(
+                index=index,
+                start=_float_or_none(segment.get("start")),
+                end=_float_or_none(segment.get("end")),
+                term_count=analysis["term_count"],
+                ordered_term_count=analysis["ordered_term_count"],
+                term_overlap_ratio=analysis["term_overlap_ratio"],
+                text_excerpt=text[:240],
             )
+        )
     return PromptEchoResult(
         status="detected" if suspect_segments else "passed",
         segment_count=len(segments),
         suspect_segments=tuple(suspect_segments),
+        term_only_segment_indexes=tuple(term_only_segment_indexes),
     )
 
 
@@ -236,18 +243,27 @@ def prompt_echo_payload(result: PromptEchoResult) -> dict[str, Any]:
             }
             for segment in result.suspect_segments
         ],
+        "term_only_segment_indexes": list(result.term_only_segment_indexes),
     }
 
 
 def prompt_echo_tail_start(result: PromptEchoResult) -> int | None:
-    """Return the first segment index to trim when all suspect segments are a suffix."""
+    """Return the first segment index to trim when all suspect segments are a suffix.
+
+    Segments after the last suspect that hold nothing but prompt terms (too few to be suspects on their own,
+    e.g. a final "The Circuit.") are part of the same echo and are trimmed with it.
+    """
     if not result.suspect_segments:
         return None
     suspect_indexes = {segment.index for segment in result.suspect_segments}
+    term_only_indexes = set(result.term_only_segment_indexes)
     tail_start = result.segment_count
+    while tail_start > 0 and tail_start - 1 in term_only_indexes:
+        tail_start -= 1
+    echo_end = tail_start
     while tail_start > 0 and tail_start - 1 in suspect_indexes:
         tail_start -= 1
-    if tail_start == result.segment_count:
+    if tail_start == echo_end:
         return None
     if any(index < tail_start for index in suspect_indexes):
         return None
@@ -365,6 +381,34 @@ def _is_prompt_echo(analysis: dict[str, Any]) -> bool:
         and int(analysis["ordered_term_count"]) >= MIN_ECHO_ORDERED_TERMS
         and float(analysis["term_overlap_ratio"]) >= MIN_ECHO_OVERLAP_RATIO
     )
+
+
+def _is_term_only(text: str, terms: Sequence[str]) -> bool:
+    """True when the text is prompt terms separated only by whitespace and Unicode punctuation.
+
+    Terms are matched once against the original text; non-CJK terms must not touch a letter or digit,
+    so "armrest" is not ARM + REST.
+    """
+    pattern = "|".join(_term_pattern(term) for term in sorted(terms, key=len, reverse=True))
+    matched = False
+    position = 0
+    for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+        if not _is_separator_text(text[position : match.start()]):
+            return False
+        matched = True
+        position = match.end()
+    return matched and _is_separator_text(text[position:])
+
+
+def _term_pattern(term: str) -> str:
+    body = r"\s+".join(re.escape(part) for part in term.split())
+    if _CJK_RE.search(term):
+        return f"(?:{body})"
+    return rf"(?<![^\W_])(?:{body})(?![^\W_])"
+
+
+def _is_separator_text(text: str) -> bool:
+    return all(char.isspace() or unicodedata.category(char).startswith("P") for char in text)
 
 
 def _term_in_text(term: str, text: str) -> bool:
